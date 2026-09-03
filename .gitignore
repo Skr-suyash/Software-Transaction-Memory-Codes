@@ -1,0 +1,47 @@
+# Compiled binaries and executables
+*.exe
+*.out
+*.app
+*.hex
+*.bin
+
+# Object files and intermediate compile artifacts
+*.o
+*.obj
+*.o.d
+*.d
+
+# Static and dynamic libraries
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Debug files
+*.pdb
+*.ilk
+*.idb
+*.dSYM/
+*.suo
+
+# Build and output directories
+build/
+bin/
+out/
+target/
+dist/
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.swp
+*~
