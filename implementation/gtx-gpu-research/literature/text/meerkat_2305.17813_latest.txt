@@ -1,0 +1,2661 @@
+
+=== PAGE 1 ===
+arXiv:2305.17813v2  [cs.DC]  2 Jun 2023
+Meerkat: A Framework for Dynamic Graph Algorithms on
+GPUs
+Kevin Jude Concessao1, Unnikrishnan Cheramangalath1, MJ Ricky Dev2, and Rupesh
+Nasre2
+1Indian Institute of Technology Palakkad
+2Indian Institute of Technology Madras
+Abstract
+Graph algorithms are challenging to implement due to their varying topology and irregular access
+patterns. Real-world graphs are dynamic in nature and routinely undergo edge and vertex additions, as
+well as, deletions. Typical examples of dynamic graphs are social networks, collaboration networks, and
+road networks. Applying static algorithms repeatedly on dynamic graphs is ineﬃcient. Further, due to
+the rapid growth of unstructured and semi-structured data, graph algorithms demand eﬃcient parallel
+processing. Unfortunately, we know only a little about how to eﬃciently process dynamic graphs on
+massively parallel architectures such as GPUs. Existing approaches to represent and process dynamic
+graphs are either not general or ineﬃcient. In this work, we propose a library-based framework for
+dynamic graph algorithms that proposes a GPU-tailored graph representation and exploits the warp-
+cooperative execution model. The library, named Meerkat, builds upon a recently proposed dynamic
+graph representation on GPUs. This representation exploits a hashtable-based mechanism to store a ver-
+tex’s neighborhood. Meerkat also enables fast iteration through a group of vertices, such as the whole
+set of vertices or the neighbors of a vertex. We ﬁnd that these two iteration patterns are common, and
+optimizing them is crucial for achieving performance. Meerkat supports dynamic edge additions and
+edge deletions, along with their batched versions. Based on the eﬃcient iterative patterns encoded in
+Meerkat, we implement dynamic versions of the popular graph algorithms such as breadth-ﬁrst search,
+single-source shortest paths, triangle counting, weakly connected components, and PageRank. Com-
+pared to state-of-the-art dynamic graph analytics framework Hornet, Meerkat is 12.6×, 12.94×, and
+6.1× faster, for query, insert, and delete operations, respectively. Using a variety of real-world graphs,
+we observe that Meerkat signiﬁcantly improves the eﬃciency of the underlying dynamic graph algo-
+rithm. Meerkat performs 1.17× for BFS, 1.32× for SSSP, 1.74× for PageRank, and 6.08× for WCC, better
+than Hornet on an average.
+1
+Introduction
+Real-world graphs undergo structural changes: nodes and edges get deleted, and new nodes and edges are
+added. Handling dynamic updates poses new challenges compared to a static graph algorithm. Eﬃcient
+handling of these dynamic changes necessitates (i) how to represent a dynamically changing graph, (ii)
+how to update only the relevant part of the graph depending upon the underlying algorithm, and (iii)
+This project is supported by National Supercomputing Mission, India
+1
+
+=== PAGE 2 ===
+how to map this update eﬀectively on the underlying hardware. These issues exacerbate on massively
+parallel hardware such as GPUs due to SIMD-style execution, the need to exploit on-chip cache for optimal
+performance, and nuances of the synchronization protocols to deal with hundreds of thousands of threads.
+Eﬀective addressing of these issues demands new graph representations, binding of the theoretical and
+systemic graph processing, and tuning the implementation in a GPU-centric manner. Former research
+has invented multiple graph representations in diﬀ-CSR [28], SlabGraph [7], faimGraph [37], Hornet [10]
+and cuStinger [19] to maintain the changing graph structure. The SlabGraph framework [7] proposes the
+SlabHash [5]-based graph data structure and follows a warp-based execution model.
+Dynamic graph algorithms can be categorized as (i) incremental wherein nodes and edges are only
+added, (ii) decremental wherein nodes and edges are only deleted, and (iii) fully dynamic which involves
+both the incremental and the decremental updates. A few prior works deal primarily with one of these
+types. For instance, Lacki in [24] proposes a decremental strongly connected components algorithm.
+Existing solutions to deal with dynamic graphs are plagued with one of the two issues: they apply to
+certain types of graphs, or they are ineﬃcient at scale. Thus, the solutions may work well for small-world
+graphs such as social networks but are expensive on road networks which are characterized by large diam-
+eters. Central to solving these issues lie two fundamental questions related to storage and compute: how to
+represent a dynamic graph and how to enumerate through a set of graph elements (such as vertices). Graph
+representation is crucial because the optimal representation for static processing quickly goes awry with
+dynamic updates. Thus, due to dynamic edge addition, memory coalescing on GPUs can be adversely af-
+fected, resulting in reduced performance. Similarly, two types of iterators are common in graph processing:
+through all the current graph vertices, and through the latest neighbors of a vertex (which change across
+updates). Both these operations are so common that we treat them like primitives, whose performance
+crucially aﬀects that of the underlying dynamic graph algorithm. Note that unlike in the case of a static
+graph algorithm which may suﬀer from load imbalance due to diﬀerent threads working on vertices hav-
+ing diﬀerently-sized neighborhoods, the issue of load imbalance is severe in a dynamic graph algorithm, as
+the load imbalance itself may vary across structural updates, leading to unpredictable performance results.
+This makes applying optimizations in a blanket manner diﬃcult for dynamic graphs and demands a more
+careful custom processing. Such customization allows the techniques to apply to diﬀerent algorithms as
+well as to diﬀerent kinds of updates for the same dynamic graph algorithm.
+This paper makes the following contributions:
+1. We illustrate mechanisms to represent and manipulate large graphs in GPU memory using a hash-
+table based data-structure. Our proposed dynamic graph framework Meerkat, makes primitive op-
+erations eﬃcient, such as iterating through the current neighbors of a node, iterating through the
+newly added neighbors of a node, etc.
+2. Using the eﬃcient primitives in Meerkat, we demonstrate dynamic versions of popular graph algo-
+rithms on GPUs: breadth-ﬁrst search (BFS), single source shortest paths (SSSP), triangle counting,
+PageRank, and weakly connected components (WCC). Apart from the common patterns among these
+algorithms, we highlight their diﬀerences and how to eﬃciently map those for GPU processing.
+3. We qualitatively and quantitatively analyze the eﬃciency of our proposed techniques implemented
+in Meerkat using a suite of large real-world graphs and four dynamic algorithms (namely, BFS, SSSP,
+PageRank, and Triangle Counting) and one incremental-only algorithm (namely, WCC). Meerkat
+eases programming the dynamic algorithms and readily handles both the bulk and the small batch
+updates to the graph object. We illustrate that the dynamic algorithms built on Meerkat signiﬁcantly
+outperform their static counterparts.
+2
+
+=== PAGE 3 ===
+4. Compared to state-of-the-art dynamic graph analytics framework Hornet, Meerkat is 12.6× times
+faster for query, 12.94× faster for bulk insert, and 6.1× for bulk delete operations. Meerkat performs
+6.08× for weakly connected components, 1.17× for BFS, 1.32× for SSSP, and 1.74× for PageRank,
+better than Hornet on an average.
+2
+Motivation
+Awad et al. [7] propose a dynamic graph data structure (which we shall refer to as SlabGraph) that uses
+the SlabHash data structure [6] for maintaining the vertex adjacencies. SlabGraph exploits a concurrent
+hashtable per vertex to store adjacency lists using a form of chaining. The data structure is designed and
+optimized for warp-based execution on the GPU. SlabGraph allocates a SlabHash object for each vertex.
+A SlabHash object has a ﬁxed number of buckets, determined a priori by the load-factor and the number
+of adjacent vertices. Each bucket corresponds to a slab list: a linked list of slabs. Each slab is 128 bytes
+long, to closely match the L1 cache line size, for coalesced memory access within a single warp [6] . The
+adjacent vertices of a source vertex are stored in one of the buckets determined by a hashing function.
+The 128 bytes in a slab form 32 lanes with 4 bytes per lane (32 is the GPU’s warp size). Each lane is to be
+processed by a corresponding thread in the warp. The last lane is reserved for storing the address of the next
+slab. SlabHash’s ConcurrentSet (Concurrent Map, respectively) is used for unweighted (weighted,
+respectively) graphs to store the adjacent neighbours for each vertex. Every slab in the ConcurrentSet
+can be used to store up to 31 neighbouring vertices. The last lane in a ConcurrentSet slab is reserved for
+storing the address of the next slab. While all threads participate in retrieving a single ConcurrentSet
+slab, only 31 threads participate actively in query/traversal operations, since their corresponding slab lanes
+potentially could have vertex data. The last thread fetches the next slab’s address and is used for performing
+traversal to the next slab. A ConcurrentMap slab used for a weighted graph can store up to 15 pairs of
+the neighboring vertices and their respective edge-weights adjacent elements, as the graphs are weighted.
+It can store up to 15 pairs of the neighboring vertices and their respective edge weights. When a slab is
+retrieved by a warp, every pair of a neighboring vertex and an edge weight is fetched by a pair of threads.
+While 30 threads are involved in fetching edge-related data, only 15 threads are involved in processing
+15 pairs in the ConcurrentMap slab. Like the case of a ConcurrentSet slab, the last thread fetches
+the next slab’s address and is used for performing a traversal to the next slab. A graph with an average
+degree greater than 15 would allocate at least 2.1× more slabs for the weighted SlabGraph representation
+(with ConcurrentMap), than the unweighted representation (with ConcurrentSet), requiring at least
+2.1× more slab retrievals in processing weighted representation. The weighted representation has 48.4%
+processing eﬃciency compared to the unweighted representation in a full graph traversal operation. An
+EMPTY_KEY1 is stored in a slab lane if it has not been populated with an adjacent vertex previously, and
+with a special TOMBSTONE_KEY2 if the slab lane previously held a valid vertex, and is now deleted. Elements
+within a slab are unordered allowing eﬃcient concurrent access. A slab can be processed eﬃciently by all
+the threads of a warp by using warp-wide communication intrinsics such as __ballot_sync,__shfl_sync,
+and __shfl_down_sync [29]. The warp-cooperative work strategy (WCWS) for searching in a SlabHash
+hash table is described by [5] and the same is used in the Meerkat framework.
+The SlabGraph data structure provides eﬃcient ways for the insertion and deletion of edges on dy-
+namic graph objects. Unlike other dynamic graph data structures, such as Stinger [15] and Hornet [10],
+1EMPTY_KEY is deﬁned as UINT32_MAX-1 for ConcurrentSet and UINT64_MAX-1 for ConcurrentMap
+2TOMBSTONE_KEY is deﬁned as UINT32_MAX-2 for ConcurrentSet and a 64-bit pair ⟨UINT32_MAX-2,
+UINT32_MAX-2⟩for
+ConcurrentMap
+3
+
+=== PAGE 4 ===
+only SlabGraph relies on Warp Cooperative Work Sharing (WCWS) execution model [6]. The SlabGraph
+data structure has the below shortcomings.
+Memory Allocation: The original SlabHash data structure assumes the responsibility of allocating the
+head slabs via cudaMalloc in ConcurrentMap or ConcurrentSet. Thus, when a SlabHash object is
+associated with each vertex, and when at least one head slab for each vertex, even when the vertex has
+no incident edges. This is required for maintaining the dynamic graph capabilities of SlabGraph. Since
+real-world input graphs often have millions of vertices, we observed that a large number of cudaMalloc
+calls (as many as the number of vertices) for a slab of size 128 bytes results in a signiﬁcant explosion in the
+total memory allocated.
+Traversal of Edges: Programming dynamic algorithm becomes easy when the underlying framework
+provides diﬀerent iterators to traverse through all the edges in the graph. This is missing in SlabGraph.
+Developing an edge-centric algorithm (such as single-source shortest path or triangle counting) without
+such a facility is diﬃcult.
+WarpLevel APIs: Understanding and using low level warp primitives is involved. The WCWS can be
+made easy with abstractions for primitive operations such as reduction and communication within a warp.
+This is missing in SlabGraph.
+Auxiliary Data Structures: Programming diﬀerent dynamic algorithms is made easy with the help of
+auxiliary data structures that work on top of the dynamic graph data structure. This is missing in Slab-
+Graph.
+These shortcomings in SlabGraph motivated us to implement Meerkat. Meerkat makes programming
+dynamic graph algorithms easy and we were able to program eﬃcient dynamic graph algorithms for SSSP,
+BFS, PR, TC, and WCC. We did a quantitative and qualitative analysis of our results with Hornet, a state-
+of-the-art dynamic graph framework.
+3
+Meerkat Framework
+Our work Meerkat builds and improves upon SlabGraph [7] by extending the publicly available source
+code for SlabHash3. Figure 1 shows the extensions done by us to SlabGraph in our framework Meerkat.
+Dynamic graph algorithms on GPUs demand two crucial considerations: memory eﬃciency due to
+dynamic updates, and computation eﬃciency since the dynamic processing should be faster than rerunning
+the static algorithm on the modiﬁed graph. Based on this goal, Meerkat oﬀers a two-pronged approach. In
+Meerkat, we move the responsibility of allocating the head slabs in SlabHash outside (to SlabGraph part
+of Meerkat) for all the vertices, as the framework has a better picture of the overall allocation. Section 6
+demonstrates the signiﬁcant memory savings with this approach.
+Second, Meerkat provides a set of iterators for traversing through the neighbors of a vertex, which
+is a fundamental requirement for almost all graph algorithms, such as BFS and SSSP. SlabGraph [7] fo-
+cuses mainly on the representation and operations of dynamic graphs. In many incremental algorithms
+such as weakly-connected components, it is suﬃcient to process the updates performed on the graph rep-
+resentation. Our iterators in Meerkat (see Section 3.4) enable us to traverse through individual buckets
+selectively, through all the slab lists for a vertex, or visit only those slabs holding new updates, depending
+on the requirements of the underlying dynamic graph algorithm.
+Third, The Meerkat framework provide abstractions for warp-level APIs such as reduction, and broad-
+cast. The Meerkat framework comes with auxiliary data structures such as Frontier, and Union-Find to
+ease programming dynamic graph algorithms.
+3https://github.com/owensgroup/SlabHash
+4
+
+=== PAGE 5 ===
+SlabGraph
++ Allocation of Head Slabs
++ Record Slab Updates
+Aux. Data Structures
++ Union-Find
++ Frontier Abstractions
+Dynamic Graph Algorithms
++ Weakly Connected Components
++ Breadth First Search
++ Single Source Shortest Path
++ PageRank
++ Triangle Counting
+ConcurrentMap
+- Allocation of Head Slabs
++ Record Slab Updates
+ConcurrentSet
+- Allocation of Head Slabs
++ Record Slab Updates
+Iterators
++ BucketIterator
++ SlabIterator
++ UpdateIterator
+SlabAlloc
+SlabAllocLight
+Unweighted Edge
+Weighted Edge
+Dynamic Graph Representation
+Slab Allocators: Adjacent
+vertices stored in slabs
+Store/iterate edge
+adjacencies for each
+source vertex
+Figure 1: Our proposed Meerkat framework and its dependencies. Teal colored text shows our extensions.
+3.1
+Memory Management in Meerkat
+Meerkat moves the responsibility of allocating the head slabs from SlabHash to the SlabGraph object
+which decides the number of slabs required per vertex according to the load factor (See Figure 1). A single
+large array of head_slabs is allocated using a single cudaMalloc() function call. Each vertex is assigned
+a speciﬁc number of head slabs according to the initial degree. We maintain an array (bucket_count)such
+that bucket_count[v] is the initial number of head-slabs allocated for a given vertex 푣. By performing an
+exclusive_scanoperation on the entries of the bucket_countarray, we can determine the oﬀset to the to
+the head slab for each vertex within the head_slabs array. Each SlabHash object for a vertex maintains a
+unique context object, which stores device pointers to these allocated slab lists, and is, therefore, shallowly
+copied to the device’s global memory. Every graph search/operation index into an array of SlabHash
+context objects, to retrieve the object for the source vertex. Using the hash function, the particular slab
+list which is to store the destination vertex is determined. This slab list is then linearly traversed by the
+warp which has the source vertex in its work queue. When a bucket is full, the underlying SlabHash data
+structure invokes a custom allocator to obtain a new slab.
+Similar to the SlabHash implementation, a SlabGraph object maintains a device context object that
+is shallowly copied into the device memory. While the vertex adjacencies are represented and acces-
+sible through these SlabHash context objects, the SlabGraph context object provides clean API ac-
+cess for vertex adjacency access and graph manipulation operations inside a device kernel by utilizing
+a warp-cooperative work strategy. The SlabHash context object supports methods such as Insert() and
+Delete() that execute in a warp-cooperative fashion. These methods are internally used by SlabGraph’s
+device API’s such as InsertEdge() and DeleteEdge(), for inserting and removing adjacent vertices for a
+speciﬁc vertex, respectively.
+5
+
+=== PAGE 6 ===
+3.2
+Warp Level APIs in Meerkat
+The warp cooperative work sharing execution model relies on each warp processing the neighbours of
+the same vertex, using warp intrinsics. The warp maintains a queue of such vertices which are elected
+in turns, in First in First Out (FIFO) fashion, using lane-id’s of the threads in a warp. Meerkat provides
+an abstraction for such a queue(FIFO) for each warp. This is implemented using the warp level primitives
+__ballot_sync() and __ffs(). The pseudocode for the warpdequeue() operation of the warp-private
+queue is given in Algorithm 1. The explanation of the warpdequeue() operation is given in Section 3.4
+along with Algorithm 3. These API functions abstract the warp level primitives and eases programming dy-
+namic graph algorithms in Meerkat. The Meerkat framework also provides APIs for warp level reductions
+and broadcast (see Algorithms 1 and 2).
+Algorithm 1: Meerkat Warp device
+APIs: dequeue and reduction
+1 __device__ int warpdequeue (bool
+*to_process) {
+2
+int work_queue =
+__ballot_sync(0xFFFFFFFF,
+*to_process)
+3
+index = __ffs (work_queue) - 1
+4
+if (푙푎푛푒_푖푑() == 푖푛푑푒푥) then
+5
+*to_process = false
+6
+end if
+7
+return index
+8 }
+9
+__device__ int warpbreductionsum(T *val)
+{
+10
+int i = 1;
+11
+while (푖< 32) do
+12
+*val += __shfl_xor_sync
+(0xFFFFFFFF, F, *val, i)
+13
+i = i × 2
+14
+end while
+15
+return val
+16 }
+Algorithm 2: MeerkatWarp device APIs:
+broadcast, and frontier enqueue
+1 __device__ void
+warpenqeuefrontier(Frontier<T> frontier, T
+value, bool to_enqueue) {
+2
+uint32 bit_set =
+__ballot_sync(0xFFFFFFFF, to_enqueue)
+3
+uint32 current_base = 0
+4
+if (푙푎푛푒_푖푑() == 0) then
+5
+current_base = atomicAdd
+(&frontier.size, __popc(bit_set))
+6
+end if
+7
+current_base = __shfl_sync(0xFFFFFFFF,
+current_base, 0, 32)
+8
+if (푡표_푒푛푞푢푒푢푒) then
+9
+uint32 oﬀset = __popc(__brev(bit_set)
+& (0xFFFFFFFF << (32 - lane_id)))
+10
+frontier[current_base + oﬀset] = value
+11
+end if
+12 }
+13 __device__ int warpbroadcast (T *val, int
+lane_id) {
+14
+*val = __shfl_sync (0xFFFFFFFF, *val,
+lane_id)
+15 }
+The Meerkat framework targets GPU, and the device API comes with detailed abstractions for program-
+ming dynamic graph algorithms. The neighbors of a vertex src can be obtained using the call to the API
+function GetEdgeHashCtxts()with src as the argument. The Meerkat framework provides diﬀerent types
+of iterators to traverse over the adjacent vertices for a vertex. These iterators are named as SlabIterator,
+BucketIterator, and UpdateIterator (See Section 3.4). These iterators come with functions begin(),
+end(), beginAt(), and endAt(). These functions are briefed in Table 1.
+6
+
+=== PAGE 7 ===
+API
+Parameters
+Description
+begin()
+-
+Returns a SlabIterator to the ﬁrst slab, in the ﬁrst slab list
+end()
+-
+Returns an invalid SlabIterator to a logically invalid slab (that is, at
+INVALID_ADDRESS)
+beginAt()
+index
+Returns a BucketIteratorto the ﬁrst slab in the index’th slab list for the source
+vertex
+endAt()
+index
+Returns an invalid BucketIterator to a logically invalid slab in the index’th
+slab list
+updateBegin()
+-
+Returns an UpdateIterator to the ﬁrst slab holding incremental updates. The
+iterator is invalid if updates are not available for the source vertex.
+updateEnd()
+-
+Returns an invalid UpdateIterator to a logically invalid slab (that is, at
+INVALID_ADDRESS)
+Table 1: Meerkat: Iterator API of SlabHashCtxt representing a source vertex.
+3.3
+Auxiliary Data Structures
+3.3.1
+Union-Find
+In Meerkat, the static and incremental WCC implementation uses the union-ﬁnd approach for discovering
+weakly-connected components. Meerkat provides the Union-Async strategy [2] for the union operation
+for the adjacent edges discovered, and full path compression for determining the representative elements
+for the vertices in find operation.
+3.3.2
+Frontier
+A frontier of type F<T> is internally an array of elements of type 푇. Each frontier object supports integer-
+based indexing for accessing its elements by our kernel threads. Every frontier object maintains a 푠푖푧푒
+attribute to indicate the number of elements in the frontier array. Insertion of elements into a frontier
+object is performed by the warp-cooperative warpenqueuefrontier() function. All threads in the warp
+must be active for its correct invocation. The function warpenqueuefrontier() takes a 푓푟표푛푡푖푒푟object,
+a 푣푎푙푢푒to be inserted into 푓푟표푛푡푖푒푟, and a boolean 푡표_푒푛푞푢푒푢푒predicate to indicate whether the invoking
+thread has element participates to insert an element into the 푓푟표푛푡푖푒푟. After the bitset of participating
+threads is computed with a __ballot_sync(line 2), the ﬁrst warp thread increments the size of the frontier
+by the number of elements to be inserted by the warp (lines 4-5). The base oﬀset obtained by the ﬁrst thread
+(line 5), is broadcasted to all the warp threads (line 7). Each participating thread writes its element into the
+frontier (line 10) by counting the number of participating threads present in the warp positionally before
+itself (line 9).
+Our implementations for the BFS and SSSP algorithms on Meerkat, both static and dynamic, rely on
+using a pair of frontiers for driving their iterations: a frontier 푓푐푢푟푟푒푛푡holding a set of edges whose des-
+tination vertices must be inspected; the outgoing edges from these destination vertices which have been
+updated populate the frontier 푓푛푒푥푡to be used for the next iteration.
+3.4
+Graph Primitives
+One of the primitive graph operations is to iterate through the neighbors of each vertex. Our Meerkat
+framework maintains three types of iterators: SlabIterator, BucketIterator,and UpdateIterator(see
+Table 2). UpdateIterator is an optimized version of SlabIterator customized for incremental-only
+graph processing (no deletions).
+7
+
+=== PAGE 8 ===
+Iterator
+Description
+SlabIterator
+traverses through all the slabs contained in the slab lists for a given vertex, one slab
+list at a time
+BucketIterator
+our primitive form of SlabHash iterator; traverses through all the slabs of a single
+slab-list only
+UpdateIterator
+traverses through only those slabs containing new adjacent vertices, contained in
+updated slab-lists
+Table 2: Meerkat iterators
+Function
+Description
+Meerkat Iterator-speciﬁc methods
+iter.operator++()
+Advances the iterator to the next slab in sequence.
+iter.get_pointer()
+accepts a lane-id (0-31), returns a pointer to an element within a slab with an oﬀset
+of lane-id
+iter.first_lane_id()
+used when iter is an UpdateIterator; returns laneid of the ﬁrst new neighbor in
+the slab
+Meerkat context object-speciﬁc methods
+G.get_vertex_adjacencies()
+returns pointer to a device vector of SlabHash objects; i’th element has neighbors
+of i’th vertex
+begin()
+returns a SlabIterator to the ﬁrst slab, in the ﬁrst slab list
+begin_at(i)
+returns a BucketIterator to the ﬁrst slab in the i’th slab list
+update_begin()
+returns an UpdateIterator to the slab at alloc_addr located within the ﬁrst up-
+dated slab list
+end(), update_end(),end_at(i)
+returns an iterator to a logically invalid slab (that is, at INVALID_ADDRESS)
+Meerkat Other intrinsics
+thread_id()
+returns global id of calling thread (blockDim.x × blockIdx.x + threadIdx.x)
+lane_id()
+returns the position of a thread within a warp (in the range [0, 31]) (threadIdx.x
+& 0x1F)
+global_warp_id()
+returns the global id for a warp (thread_id() >> 5)
+is_valid_vertex()
+returns true if v is a valid vertex-id (v ≠INVALID_KEY and v ≠TOMBSTONE_KEY)
+Table 3: Meerkat primitives
+The unit of access for all our iterator variants is a slab. Both the ConcurrentSet slab and the Concur-
+rentMap have the same size and store the next slab’s address at identical locations. Consequently, our iter-
+ators have been designed to be decoupled from the implementation of our backing stores (ConcurrentSet/
+ConcurrentMap): they expose the same API (see iterator-speciﬁc methods in Table 3) for both the weighted
+and unweighted representation of Meerkat. Our iterators behave identically in the manner of traversal of
+slabs and in the retrieval of slab content, regardless of whether ConcurrentSet or ConcurrentMap is
+used for storing the neighbors of a vertex.
+A BucketIterator is constructed for a speciﬁc slab list in the slab-hash table. The SlabIterator
+is an abstraction over the BucketIterator: the SlabIterator internally maintains a BucketIterator
+for the ﬁrst slab list on construction. When the ﬁrst slab list has been traversed, it maintains an itera-
+tor for the second slab list, and so on, until all the slab lists for a vertex have been fully traversed. The
+begin_at(bucket_id) on a slab hash table constructs an iterator to the ﬁrst slab of the slab list indexed
+with bucket_id. The end_at() method returns an iterator for a logical sentinel slab for the slab list. The
+slab hash tables expose begin() and end() methods for retrieving the iterators to the ﬁrst slab, and to a
+sentinel slab respectively, for the entire hash table, storing the adjacent vertices.
+Both types of iterators are equality-comparable and support the increment operation. The increment
+8
+
+=== PAGE 9 ===
+operator changes its internal state to refer to the elements in the next slab in sequence. Both the itera-
+tors support the get(lane_id) method to obtain the element stored at a given lane_id of the slab. We
+use is_valid_vertex() to determine if the value returned by iterator.get(lane_id) is suitable for
+processing by our algorithms using these iterators (see Table 3).
+Algorithm 3: Iteration Scheme 1 (using SlabIterator)
+1 function IterationScheme1 (Graph G, Vertex V[vertex_n]) {
+2
+Vertex_Dictionary* vert_adjs[] = G.get_vertex_adjacencies();
+3
+if ((푡ℎ푟푒푎푑_푖푑() −푙푎푛푒_푖푑)) < 푣푒푟푡푒푥_푛)) then
+4
+bool to_process = (thread_id() < vertex_n);
+5
+int dequeue_lane = 0; /* queue size is warpsize (i.e 32)
+*/
+/* dequeue() API internally uses __ballot_sync() and __ffs warp primitive
+*/
+6
+while ((푑푒푞푢푒푢푒_푙푎푛푒= 푤푎푟푝푑푒푞푢푒푢푒(&푡표_푝푟표푐푒푠푠)) ≠−1) do
+7
+int common_tid = (thread_id() - lane_id() + dequeue_lane);
+8
+Vertex src = V[common_tid]; /* all warp threads process neighbours of vertex src
+*/
+9
+SlabIterator iter = G.vert_adjs[src].begin();
+10
+SlabIterator last = G.vert_adjs[src].end();
+/* warp cooperative processing of adjacency slabs of vertex src
+*/
+11
+while (푖푡푒푟≠푙푎푠푡) do
+12
+Vertex v = iter.get_pointer(lane_id()); /* each warp thread index to different slab
+entry
+*/
+13
+if (푖푠_푣푎푙푖푑_푣푒푟푡푒푥(푣)) then
+/* Process adjacent vertex, if the slab-entry is not TOMBSTONE_KEY
+*/
+14
+end if
+15
+++iter;
+16
+end while
+/* Post-processing
+*/
+17
+end while
+18
+end if
+19 }
+We describe two diﬀerent schemes for enumerating neighbors. Algorithm 3 describes the ﬁrst iteration
+scheme, namely IterationScheme1. The CUDA kernel accepts a dynamic graph 퐺, and an array of vertices
+퐴푣whose adjacencies in the graph 퐺are to be to visited. For example, this array 퐴푣could be holding a
+frontier of vertices in the 퐵퐹푆algorithm whose adjacencies have to be visited in a given iteration. The
+CUDA kernel is invoked with 푡threads where, 푡=
+j
+퐴푣.푙푒푛푔푡ℎ+퐵푆−1
+퐵푆
+k
+. BS refers to the thread-block size
+chosen for the kernel invocation and must be equal to a multiple of the warp-size. The warp-size is equal
+to 32 for the GPU we used for experimental evaluation. In In other words, the kernel is invoked with a
+number of threads equal to the smallest multiple of the thread-block size above or equal to 퐴푣.푙푒푛푔푡ℎ. It is
+necessary for the thread-block size to be a multiple of the warp size for the successful execution of intra-
+warp communication primitives such as __ballot_sync [29], used for work-cooperative work strategy
+extensively used in the implementation of our algorithms. The expression (푡ℎ푟푒푎푑_푖푑() −푙푎푛푒_푖푑()) ﬁnds
+the thread-id of the ﬁrst thread in a warp. The predicate at Line 3 allows only those warps which have
+at least one thread with thread-ids less than the number of vertices in the graph, to proceed with the
+computation.
+9
+
+=== PAGE 10 ===
+The vertex-id of the graph object ranges from 0 to (푣푒푟푡푒푥_푛−1). At line 4, we identify those threads
+whose thread-ids are less than vertex_n and can validly index into 푉, the array storing the list of vertices
+to process.
+The warpdequeue() function (See Lines 1-7, Algorithm 1) identiﬁes those threads within the warp
+having a vertex remaining to be processed and stores in the variable work_queue (See Line 2, Algorithm 1).
+Each set bit in the work queue corresponds to one unique thread within the warp that needs to be processed
+with the value of variable 푡표_푝푟표푐푒푠푠== true. Using the CUDA function __ffs(), we elect the ﬁrst
+outstanding thread from work_queue and store it in the local variable index (See Line 3, Algorithm 1). The
+ﬁrst outstanding bit is the ﬁrst set bit starting from the least signiﬁcant bit position. If all the bits in the
+variable work_queue have a value of zero, then the variable index will get a value of -1. The local variable
+to_process passed by reference to the warpdequeue()function is set to false for the warp thread at lane_id
+index. The warpdequeue() function then returns the value of the variable index (See Line 7, Algorithm 1).
+The value returned by the warpdequeue() function is assigned to the variable dequeue_lane (See Line
+6). The while loop terminates when the value returned by the warpdequeue() function is -1. Thus the
+loop at Lines 6–17 continues as long as there is an outstanding thread within the warp whose associated
+vertex is left to process. All the threads within the warp, index into the same position of the Vertex array
+푉, and the Vertex variable src will have the same value for all threads in the warp (See Lines 7-8. A pair of
+SlabIterators, namely iter, and last, are constructed (Lines 9–10) to traverse through the slabs storing
+the adjacent vertices of the Vertex 푠푟푐(within the loop at Lines 11–15). All the threads within the warp
+perform a coalesced memory access to the contents of the slab represented by iter (Line 12). If the value
+fetched by the thread from the current slab represents a valid vertex, (line 13), the thread processes it as
+the adjacent vertex. After processing the current slab, the iterator iter is incremented so that it refers to
+the next slab in the sequence.
+Unlike IterationScheme1 which uses SlabIterators, IterationScheme2 (presented in Algorithm 4) uses
+BucketIterators and eliminates the use of a work queue of vertices, and instead operates with a grid-
+stride loop. This iteration scheme imposes no restriction on the number of thread blocks. However, for the
+warp-level primitives (such as __shfl_sync) to work correctly on the slabs, the number of active threads
+within a thread-block must be a multiple of the warp-size (32 on our GPU). Since the adjacencies of a
+vertex are distributed among multiple slab lists, a slab list can thus be identiﬁed with a ⟨푣,푖⟩pair, which
+refers to the 푖푡ℎslab-list of a vertex 푣. Such pairs are stored in the bucket_vertex and bucket_index
+device vectors. Each loop iteration within a warp traverses and processes all the slabs contained in one
+slab-list uniquely identiﬁed by its ⟨푣,푖⟩pair. The ⟨푣,푖⟩pairs are represented in the bucket_vertex and
+bucket_index device vectors. For example, if a vertex frontier contains two vertices 푣푖and 푣푗, containing
+3 and 2 slab-lists respectively. To enable IterationScheme2 to traverse through all the their respective slabs,
+푏푢푐푘푒푡_푣푒푟푡푒푥[] is initialized as
+
+푣푖,푣푖,푣푖,푣푗, 푣푗
+
+, and 푏푢푐푘푒푡_푖푛푑푒푥[] is initialized as [0, 1, 2, 0, 1].
+The total number of warps in the kernel is computed and stored in warps_n (at line 3). Each warp
+is uniquely identiﬁed with a global-warp id (computed at line 4). By using its global_warp_id as the
+initial value for index variable 푖, each warp identiﬁes its bucket ⟨푣,푖⟩to process by indexing into the
+bucket_vertex and bucket_index vectors (See Lines 7–8). This index is incremented at the stride of
+the total number of warps in the grid for the CUDA kernel (Line 17).
+IterationScheme1 exploits the warp-based processing and schedules one vertex to a warp for processing
+the neighboring vertices. Although the adjacent vertices within a slab are accessed in a coalesced fashion,
+the number of slabs inspected is ultimately determined by the degree of the vertex. This leads to an im-
+balance in the amount of work assigned to each warp if the vertex degree variance is high. This concern
+is alleviated signiﬁcantly with IterationScheme2 since the initial number of buckets for each vertex is de-
+termined using the load factor and the initial degree of that vertex. Further, hashing attempts to distribute
+10
+
+=== PAGE 11 ===
+Algorithm 4: Iteration Scheme 2 (using BucketIterator)
+1 function IterationScheme2 (Graph G, Vertex bucket_vertex[n], int bucket_index[n]) {
+2
+Vertex_Dictionary *vert_adjs= &(G.Vert_Dict[0])
+3
+int warps_n = (blockDim.x * gridDim.x) / warp_size()
+4
+int global_warp_id = thread_id() / warp_size()
+5
+int i = global_warp_id
+6
+while (푖< 푛) do
+7
+Vertex src = bucket_vertex[i]
+8
+int index = bucket_index[i]
+/* Process source vertex
+*/
+9
+BucketIterator iter = vert_adjs[src].begin_at(index)
+10
+BucketIterator last = vert_adjs[src].end_at(index)
+/* Iterate over adjacent vertices
+*/
+11
+while (푖푡푒푟≠푙푎푠푡) do
+12
+Vertex v = *iter.get_pointer(lane_id())
+13
+if (푖푠_푣푎푙푖푑_푣푒푟푡푒푥(푣)) then
+/* Process adjacent vertex
+*/
+14
+end if
+15
+++iter
+16
+end while
+/* Post-processing
+*/
+17
+i += warps_n
+18
+end while
+19 }
+the elements uniformly among the buckets. On average, Meerkat can distribute the work equally among
+the warps.
+In several incremental graph algorithms, such as incremental WCC, it is suﬃcient to iterate over
+slabs for which new adjacent vertices have been inserted. To facilitate iteration over the updated slabs
+alone, Meerkat maintains the following ﬁelds per slab list. Each slab list is augmented with a bool value
+is_updated, which is set to true if new edges are inserted into the slab list. Each slab list stores an alloca-
+tor address ﬁeld alloc_addr to store the allocator address of the ﬁrst slab in which new edges have been
+inserted. Since head slabs are allocated through cudaMalloc(), we use a special value A_INDEX_POINTER
+in the alloc_addr ﬁeld, to distinguish the head slab from other slabs returned by the Meerkat allocator.
+Each slab list also stores the lane-id of the ﬁrst updated value, in the ﬁrst updated slab.
+Initially, is_updated for a slab list is set to false. The InsertEdge() device method is responsible
+for setting is_updated for a slab list to true, if an insertion occurs at the end of the slab list. For every
+SlabHash object associated with a vertex, we deﬁne UpdateIteratorsto iterate over only the slabs storing
+new vertices. In other words, we can traverse only over those slabs in which new vertices have been
+inserted. An UpdateIterator skips over slab lists for whom is_updated is false. Once the updates have
+been processed, Graph.UpdateSlabPointers() sets the is_updated ﬁeld to false, for all the slab lists
+previously set to true. For such slab lists, Graph.UpdateSlabPointers() sets alloc_addr to the last slab
+in the slab list, and lane id l to the next lane, where subsequent insertions of adjacent vertices are to take
+place (See Figure 2a). If the slab list is completely full, the lane id ﬁeld lane is assigned a special value
+INVALID_LANE to denote that the updates would occur at newly allocated slabs, chained at the end of the
+last slab. (See Figure 2b)
+Essentially, an UpdateIterator behaves like a SlabIterator, but, over slabs that are recognized to
+11
+
+=== PAGE 12 ===
+0x20
+14
+T
+· · ·
+0x2a
+22
+F
+lane
+alloc_addr
+is_updated
+· · ·
+0x20
+0x2a
+14
+21
+22
+0x2a
+UpdateSlabPointers()
+(a) Case 1
+0x20
+14
+T
+· · ·
+0x2a
+INV
+F
+· · ·
+0x20
+0x2a
+14
+30
+31
+0x2a
+lane
+alloc_addr
+is_updated
+UpdateSlabPointers()
+(b) Case 2
+Figure 2: UpdateSlabPointers()
+be holding incremental updates. Hence, like the SlabIterator, the use of UpdateIterators is only com-
+patible with IterationScheme1. In our experiments involving traversal of adjacencies of all vertices, Itera-
+tionScheme1 (with SlabIterators) outperforms IterationScheme2 (with BucketIterator) by 1.24-1.48×.
+IterationScheme2 performs marginally better with algorithms when the working set of vertices is small.
+4
+Dynamic Algorithms using Meerkat
+We evaluate Meerkat using the dynamic versions of ﬁve fundamental graph algorithms:
+Breadth First
+Search (BFS), and Single Source Shortest Path (SSSP), Triangle Counting (TC), PageRank (PR), and Weakly
+Connected Components (WCC). BFS, SSSP, TC and PR are developed for both incremental and decremental
+processing, whereas WCC is programmed only for incremental processing. The BFS, PR, TC, and WCC
+algorithms operate on unweighted graphs, and Meerkat uses ConcurrentSet for storing the adjacencies
+for every vertex. On the other hand, the SSSP algorithm requires a weighted graph representation, and
+hence, the ConcurrentMap is used for representing adjacencies of every vertex, and their respective
+edge weights. The fully-dynamic versions are implemented with incremental and decremental processing
+as two computation steps.
+4.1
+Dynamic PageRank
+The PageRank algorithm assigns a score to every vertex in the range [0, 1], which determines its importance
+in the input graph object. The PageRank value of a vertex can be understood as a probability that a random
+walk in the graph (with 푁vertices), will arrive at that vertex, computed by an iterative application of
+equation 1 for all vertices in a sequence of super-steps until a steady state/convergence condition is met [4].
+푃푅푖[푣] = 1 −푑
+푁
++ 푑·
+Õ
+푢→푣
+푃푅푖−1 [푢]
+표푢푡[푢]
+(1)
+The pseudocode for static/dynamic PageRank is discussed in Algorithm 5. Algorithm 5 accepts a dy-
+namic graph object 퐺, and an array 푃푅[푣푒푟푡푒푥_푛] which identiﬁes the PageRank value for each vertex in
+the input graph object. In the case of the static algorithm, each element in the array 푃푅[푣푒푟푡푒푥_푛] is ini-
+tialized with the value
+1
+푣푒푟푡푒푥_푛. In the incremental/decremental case, the array element 푃푅[푣] contains the
+PageRank value of the vertex 푣, computed before insertion/deletion. Each iteration of the loop (in lines 7-
+18) represents a "super-step". The PageRank values of iteration 푖, are determined from those computed in
+12
+
+=== PAGE 13 ===
+Algorithm 5: Page Rank - Static / Incremental / Decremental Algorithm
+1 function ComputePageRank (Graph 퐺, float PageRanks[vertex_n], float NewPageRanks[vertex_n], float
+error_margin = 1e-5, float damping_factor = 0.85, int max_iter = 100) {
+2
+int iterations = 0
+3
+float NewPageRanks[vertex_n]
+4
+float ContributionPerVertex[vertex_n]
+5
+float delta = 1.0
+6
+float teleport_value = 0.0
+7
+while (푑푒푙푡푎> 푒푟푟표푟_푚푎푟푔푖푛and 푖푡푒푟푎푡푖표푛푠< 푚푎푥_푖푡푒푟) do
+8
+FindContributionPerVertex(PageRanks, G.VertexOutDegrees, ContributionPerVertex)
+9
+Compute(G, ContributionPerVertex, damping_factor, NewPageRanks)
+10
+if (find(G.VertexOutDegrees, 0) == true) then
+11
+FindTeleportProb(G.VertexOutDegrees, &teleport_value)
+12
+foreach 푖in 0 . . . (푣푒푟푡푒푥_푛−1) parallel do
+13
+NewPageRanks[i] += damping_factor × teleport_value
+14
+end foreach
+15
+end if
+16
+FindDelta(PageRanks, NewPageRanks, &delta)
+17
+PageRanks ←copy(NewPageRanks)
+18
+++ iterations
+19
+end while
+20 }
+iteration 푖−1. The maximum number of iterations is upper bounded by 푚푎푥_푖푡푒푟. The iterations continue
+until 푑푒푙푡푎= Í
+푣∈푉|푃푅푖(푣) −푃푅푖−1(푣)| > 푒푟푟표푟_푚푎푟푔푖푛. In other words, 푑푒푙푡푎is the L1-Norm between
+the PageRank vectors PR푖and PR푖−1, and is computed at line 16. Ordinarily, computing the ratio 푃푅푖−1[푢]
+표푢푡[푢]
+requires two divergent memory access per every incoming 푢→푣, for computing the PageRank 푃푅푖[푣]
+for vertex 푣. This ratio does not change in a "super-step". By caching these ratios for every vertex, we can
+reduce the divergent memory accesses down to one, during the PageRank computation. The FindContri-
+butionPerVertex GPU kernel in line 8, initializes 퐶표푛푡푟푖푏푢푡푖표푛푖[푢] = 푃푅푖−1[푢]‘
+표푢푡[푢]
+for each vertex 푢, which can
+performed with coalesced memory access.
+The new PageRank values are computed in line 9 according to equation 1 and are adjusted to account
+for teleportation from zero-outdegree vertices to any other vertex in the input graph object, at lines 10-13,
+on the GPU. The teleportation probability is added to the PageRanks value for every vertex (lines 12- 13), if
+there exists any vertex 푣푧whose out-degree is zero (line 10). The teleportation probability to be computed
+at iteration 푖is given by Í
+푣푧
+푃푅푖−1[푣푧]
+푣푒푟푡푒푥_푛is computed in the FindTeleportProb GPU kernel.
+The Compute GPU kernel is invoked with a dynamic graph object 퐺storing incoming edges, an array
+of PageRank contributions for each vertex, the damping factor, and an array of new PageRank values.
+Each thread, with thread-id equal to 푣, represents a unique vertex 푣in the graph object 퐺. Hence, each
+thread maintains a local variable to hold the new PageRank value for the vertex 푣it represents. A pair of
+SlabIterator’s are constructed are constructed to traverse the slabs holding the in-edges of vertex 푣. The
+accumulation of the contribution of the in-edges to the PageRank of vertex 푣is commutative. Hence, the
+Compute kernel maintains a thread-local variable 푙표푐푎푙_푝푟푠푢푚to accumulate the PageRank contributions
+of the neighboring vertices along the incoming edges encountered by the warp threads for vertex 푣.
+13
+
+=== PAGE 14 ===
+4.2
+Dynamic Single Source Shortest Path and Breadth First Search
+Algorithm 6: SSSP - Incremental / Decremental
+input: Graph 퐺, Vertex SRC, EdgeBatches 푏푎푡푐ℎ푒푠[푏푎푡푐ℎ_푛]
+/* Static SSSP
+*/
+1 Frontier<Edge> 퐹푐푢푟푟푒푛푡, 퐹푛푒푥푡
+2 tree_node 푛표푑푒푠[푣푒푟푡푒푥_푛]
+3 InitializeDistance(SRC, nodes)
+4 CreateFrontier(퐺, 퐹푐푢푟푟푒푛푡, SRC, 퐺.get_bucket_count()[SRC])
+5 while (퐹푐푢푟푟푒푛푡.푠푖푧푒≠0) do
+6
+SSSP_Kernel(G, nodes, 퐹푐푢푟푟푒푛푡, 퐹푛푒푥푡)
+7
+swap (퐹푐푢푟푟푒푛푡, 퐹푛푒푥푡)
+8
+zero 퐹푛푒푥푡
+9 end while
+/* Dynamic SSSP
+*/
+10 zero 퐹푐푢푟푟푒푛푡, 퐹푛푒푥푡
+11 for b in batches do
+12
+if (푏.is_insertion()) then
+13
+Incremental Algorithm Prologue:
+14
+퐹푐푢푟푟푒푛푡←푏
+15
+end if
+16
+else
+17
+Decremental Algorithm Prologue:
+18
+Invalidate(b.edges, nodes)
+19
+PropogateInvalidation(nodes, SRC)
+20
+CreateDecrementalFrontier(퐺, nodes, 퐹푐푢푟푟푒푛푡)
+21
+end if
+22
+Common Epilogue:
+23
+while (퐹푐푢푟푟푒푛푡.푠푖푧푒≠0) do
+24
+SSSP_Kernel(G, nodes, 퐹푐푢푟푟푒푛푡, 퐹푛푒푥푡)
+25
+swap (퐹푐푢푟푟푒푛푡, 퐹푛푒푥푡)
+26
+zero 퐹푛푒푥푡
+27
+end while
+28 end for
+The single-source shortest path (SSSP) algorithm, described in Algorithm 6, takes a dynamic graph
+object 퐺, and single source vertex SRC, and computes the shortest path to all other vertices from SRC. In
+the dynamic setting, Algorithm 6 is batch-dynamic in nature: it takes a sequence of edge 푏푎푡푐ℎ푒푠, where
+each batch is either an incremental or decremental batch. The graph object 퐺undergoes modiﬁcations
+through the application of an insertion/deletion edge batch; the incremental/decremental SSSP algorithm
+re-computes the shortest paths/distances for the aﬀected vertices in the graph, from the vertex SRC. For
+each node 푣, let 푃푣= (푆푅퐶⇝· · · ⇝푝푎푟푒푛푡(푣) →푣) be the shortest path from the source vertex SRC. Our
+SSSP algorithm is responsible for computing < 푑푖푠푡푎푛푐푒푣,푝푎푟푒푛푡(푣) > pair4 , where 푑푖푠푡푎푛푐푒푣is the length
+of the shortest path 푃푣, and 푝푎푟푒푛푡(푣) is the predecessor to the vertex 푣in path 푃푣. Every vertex 푣must
+have a unique 푝푎푟푒푛푡(푣) in its shortest path 푃푣, which implicitly implies that every vertex 푣has a unique
+4In our implementation, we have represented the pair as a 64-bit unsigned integer, with 32-bits reserved for each half of the pair.
+This allows us to consistently update both halves of the pair with single 64-bit atomic operations on the Cuda Gpus
+14
+
+=== PAGE 15 ===
+shortest-path to the source 푆푅퐶. It is therefore understood, that by identifying the 푝푎푟푒푛푡(푣) for every
+vertex 푣, in its shortest path 푃푣, we are implicitly maintaining a directed tree 푇퐺which is rooted at 푆푅퐶,
+such that each edge 푒= (푢,푣) ∈푇퐺, 푣is the 푝푎푟푒푛푡of푢in 푃푣. Our batch-dynamic incremental/decremental
+algorithm is responsible for maintaining this dependence tree. In the ensuing discussion, a subtree in 푇퐺,
+rooted at vertex 푣, will be represented by푇푣. A formal discussion on value dependence in shortest distance
+computation and its representation as a dependence tree can be found in [35].
+Incremental SSSP
+The addition of a new edge (푢, 푣) could only result in 푑푖푠푡푎푛푐푒푛푒푤(푣) < 푑푖푠푡푎푛푐푒표푙푑(푣), if 푑푖푠푡푎푛푐푒(푢) <
+푑푖푠푡푎푛푐푒(푝푎푟푒푛푡(푣)). In such a case, the sub-tree 푇푣is transplanted under a new parent 푢in 푇퐺. All such
+shortest paths 푃푥= (푆푅퐶⇝푝푎푟푒푛푡표푙푑(푣) →푣⇝푥), are now 푃푥= (푆푅퐶⇝푢→푣⇝푥). Therefore, it is
+necessary to re-compute the shortest-path distances for all the vertices in the sub-tree푇푣. Our incremental
+SSSP algorithm takes an incremental batch of edges as the initial frontier for our static SSSP algorithm.
+Decremental SSSP
+The deletion of an edge (푢, 푣) from the graph 퐺invalidates 푑푖푠푡푎푛푐푒(푣) from the source vertex SRC, and
+the shortest paths 푃푥for all vertices 푥in the subtree 푇푣, if the edge (푢, 푣) in 퐺is also an edge in 푇퐺. If
+푑푖푠푡푎푛푐푒(푣) is invalidated on the deletion of an edge (푢, 푣), vertex 푢ceases to be 푝푎푟푒푛푡(푣). This prompts
+a propagation of invalidations for the shortest distances (from SRC) and the parent vertices determined
+for all vertices in 푇푣. In eﬀect, the previously computed 푇푣ceases to exist in 푇퐺. At this juncture, there
+are three types of vertices in the graph: (i) a set of vertices 푉푣푎푙푖푑whose shortest distances and 푝푎푟푒푛푡
+information have not been invalidated (ii) a set of vertices 푉푖푛푣푎푙푖푑whose shortest distances and 푝푎푟푒푛푡
+information have suﬀered invalidation, as a direct consequence of being destination vertices of deleted
+edges present in 푇퐺, or indirectly, as a consequence of the propagation of invalidation, and (iii) a set of
+vertices 푉푢푛푟푒푎푐ℎ푎푏푙푒which were not part of 푇퐺owing to an absence of a path from the vertex SRC in 퐺.
+Such vertices in푉푢푛푟푒푎푐ℎ푎푏푙푒will continue to remain unreachable even after a batch of edge deletions. Thus,
+the shortest paths for vertices in the 푉푖푛푣푎푙푖푑, still reachable from SRC, can be computed by taking all edges
+(푢, 푣) such that 푢∈푉푣푎푙푖푑and 푣∈푉푖푛푣푎푙푖푑, as the initial frontier for our static SSSP algorithm.
+The speciﬁc details of the implementation of the static SSSP, and the incremental/decremental algorithms,
+presented in Algorithm 6 are explained below:
+The static SSSP computation kernel does frontier-based computation: it accepts a frontier of edges
+퐹푐푢푟푟푒푛푡and until it produces a new frontier 퐹푛푒푥푡for the next invocation. The SSSP kernel is repeatedly in-
+voked it produces an empty frontier 퐹푛푒푥푡. A frontier of type F<T> is internally an array of elements of type
+푇. Each frontier object supports integer-based indexing for accessing its elements by our kernel threads.
+Every frontier object maintains a 푠푖푧푒attribute to indicate the number of elements in the frontier array. In-
+sertion of elements into a frontier object is performed by the warp-cooperative warpenqueuefrontier()
+function (see Algorithm 2). All threads in the warp must be active for its correct invocation. Line 3 ini-
+tializes the tree nodes for all vertices: it sets the shortest path distance for all vertices to INF (inﬁnity) (0
+for the source vertex SRC), and their 푝푎푟푒푛푡(푣)’s to INVALID vertex (SRC, for the source vertex SRC). Line 4
+initializes the initial frontier 퐹푐푢푟푟푒푛푡with the outgoing edges of the source vertex src
+Lines 5-8 contains the iterative application of the SSSP kernel on the current edge frontier 퐹푐푢푟푟푒푛푡, to
+produce the next edge frontier 퐹푛푒푥푡. Subsequently, 퐹푐푢푟푟푒푛푡is initialized with the newly produced frontier
+퐹푛푒푥푡(line 7). The iterative process continues until the current frontier for an iteration is non-empty, that
+is 퐹푐푢푟푟푒푛푡.푠푖푧푒≠0 (line 5). Line 6 invokes the SSSP kernel on a frontier of edges 퐹푐푢푟푟푒푛푡. Each GPU thread
+15
+
+=== PAGE 16 ===
+푡푖of the SSSP kernel is assigned one frontier edge 푒= (푒.푠푟푐,푒.푑푠푡) = (푢푓, 푣푓), where 0 ≤푖< 퐹푐푢푟푟푒푛푡.푠푖푧푒.
+The SSSP kernel updates the tree node of vertex 푣푓to store the distance 푑푛푒푤= 푑푖푠푡푎푛푐푒(푢푓) + 푒푓.푤푒푖푔ℎ푡
+of 푣푓, along the edge 푒푓, and the parent vertex 푢푓. The vertex 푣푓’s tree_node is atomically updated to
+that of 푑푛푒푤, if the old shortest path distance of 푣푓, 푑표푙푑, is greater than 푑푛푒푤, or if 푑표푙푑= 푑푛푒푤and if
+푝푎푟푒푛푡(푣푓) < 푢푓. Using a pair of SlabIterators’s for the adjacencies of 푣푓valid outgoing edges are
+identiﬁed and enqueued into the next edge frontier.
+Lines 12-14 deﬁnes the prologue for the incremental SSSP algorithm and Lines 16-20 deﬁnes the pro-
+logue for the decremental SSSP algorithm. Lines 23-26 deﬁnes the common epilogue for both the incremen-
+tal and decremental prologues. The epilogue accepts the frontiers produced by incremental/decremental
+prologues for each incremental/decremental batch and iteratively applies the static SSSP computation ker-
+nel until convergence.
+The incremental/decremental BFS algorithm uses the same kernels as that of incremental / decremental
+SSSP algorithms described in Algorithm 6 (lines 11-27). However, the static algorithm uses a fast level-based
+approach.
+4.3
+Dynamic Triangle Counting
+Our library’s dynamic triangle counting algorithm is adapted from [27], which is based on an inclusion-
+exclusion formulation. The algorithm consumes a pair of undirected graphs, namely, 퐺1 and 퐺2, and
+a sequence of 푒푑푔푒푠. For each such edge (푢, 푣) ∈푒푑푔푒푠, the the cardinality of the intersection of the
+푎푑푗푎푐푒푛푐푦(푢) in 퐺1 and 푎푑푗푎푐푒푛푐푦(푣) in 퐺2 is computed in a warp-cooperative fashion. Each thread
+is assigned an edge; the edges assigned to a warp of threads are processed using the warp cooperative
+work strategy. After electing the thread whose edge needs processing (using the warpdequeue function
+of Meerkat) the end-points are broadcasted to the warp threads using the warpbroadcast() function of
+Meerkat. A pair of SlabIterators are constructed to iterate over the neighbours of vertex 푣in 퐺2. For
+each such adjacent vertex 푎푑푗_푣we check if the edge 푢→푎푑푗_푣exists. Such an edge indicates the pres-
+ence of the triangle comprising of vertices ⟨푢, 푎푑푗_푣, 푣⟩, and the thread-local triangle count is incremented
+by one. It must be remembered that each thread in the warp sees a diﬀerent 푎푑푗_푣; hence detects dif-
+ferent triangles, at the same time. The thread-local triangle counts are ﬁnally accumulated at warp level
+using warpreduxsum() API of Meerkat and then updated to the global variable storing the total number of
+triangles.
+4.4
+Incremental WCC
+A Weakly Connected Component (WCC) of an directed graph is a subgraph where all the vertices in the
+subgraph are reachable from all others vertices in the subgraph. An eﬃcient way to compute the set of
+all WCCs in a graph object is by using the Union-Find data structure [2]. A root-based union-ﬁnd tree,
+followed by full path compression can be used eﬃciently for computing the labels for the vertices, which
+are representatives of their WCCs, in both the static and the incremental computation.
+5
+Related Work
+In the recent past, multiple frameworks have addressed the challenges dealing with dynamic graphs on
+GPUs: Hornet [10], CuSTINGER [19], GPMA [32], LPMA [40], aimGraph [38] and faimGraph [37]. The
+cuSTINGER data structure uses structure-of-arrays (SoA) representation for maintaining edges and large
+over-provisioned arrays for maintaining the vertex adjacency lists. Hornet [10] maintains several block
+16
+
+=== PAGE 17 ===
+arrays. Each block has a size of some power of two. A vertex maintains its adjacency list within one such
+ﬁtting block. On insertion, if the allocated block cannot accommodate the new edges, the adjacency list
+is migrated to a larger block in another block array. It maintains a vectorized bit-tree for determining if
+a block array has empty blocks, which is used in reclamation. Further, to identify blocks of a particular
+block size, Hornet maintains an array of B+ trees.
+Related Work
+D
+F
+CPU
+GPU
+[13], [30], [17], [12], [38]
+✓
+✗
+✓
+✗
+SlabGraph [6, 7], [32], [40], [37]
+✓
+✗
+✗
+✓
+[23], [22],[35], [42], [3], [11]
+✓
+✗
+✓
+✗
+[41]
+✗
+✓
+✗
+✓
+[15]
+✓
+✓
+✓
+[19], Hornet [10]
+✓
+✓
+✓
+D: Data Structure F: Framework 1: CPU 2: GPU
+Table 4: Comparison of Related Work
+The Packed Memory Array (PMA) [9] data structure that stores elements in a sorted order leaving
+gaps within the array for accommodating future updates. PMA is maintained as a self-balancing binary
+tree [16].
+The PMA data structure is extended for GPU [32]. This data structure suﬀers from uncoalesced memory
+accesses, overheads in obtaining locks, and lower parallelism if threads conﬂict on the same segment.
+GPMA+ [32] overcomes these limitations by ﬁrst sorting the batch updates by their keys and grouping
+the updates that fall into the same leaf segment to be processed from the leaf to the root.
+LPMA [40]
+overcomes the array expansion problem of GPMA+ by using a leveled array for maintaining the dynamic
+graph updates.
+The aimGraph [38] data structure mainly focuses on memory management for handling updates for
+a dynamic graph. By allocating a single large block of global memory, aimGraph eliminates round trips
+between the CPU and the GPU for memory allocations. Like aimGraph, faimGraph [37] utilizes a memory
+manager to handle allocation requests entirely on the GPU.
+SlabHash [5, 7] is a GPU-based concurrent dynamic hash table that utilizes a warp-cooperative work
+strategy to avoid warp divergence. SlabHash supports concurrent update and search queries in a lock-free
+manner. Like aimGraph, SlabHash also uses a GPU-based dynamic memory allocator (named SlabAlloc)
+to allocate and deallocate slabs.
+The data structures and frameworks targeting CPU are summarized in the ﬁrst and third row of Table 4
+respectively. GraSU [36] extends existing static FPGA-based graph accelerators, with dynamic graph data
+processing by proposing a programming template (or API) for graph update and computation. The PMA
+data structure is used for handling dynamic graph updates. GraSU quantiﬁes every vertex depending on
+its degree and frequency of updates and decides whether it must be cached on on-chip memory.
+ConnectIt [14] implements incremental WCC for multi-core CPUs and GConn [20] extends ConnectIt
+for GPUs. Multiple works have addressed challenges in incremental WCC on GPUs [33, 21, 34]. Dynamic
+SSSP, BFS, and MST algorithms are programmed using diﬀ-CSR data structure [28]. The computational
+complexity of dynamic graph algorithms is explored in [31].
+hornet: Hornet maintains several block arrays: Each block array is a sequence of blocks whose size
+is exactly some power of two. A vertex is assigned one such block which can accommodate all its adjacent
+vertices, that is, the size of the assigned block is the smallest power of two above the adjacency size. There
+are multiple block arrays: each array holding blocks of the same size.
+indicates whether free blocks
+17
+
+=== PAGE 18 ===
+are available in the block array or not. A new block array for a given block size may be allocated if no
+free blocks are available. For each new edge for a vertex, a GPU thread searches for free space within the
+vertex’s edge block. This is warp-divergent in nature. However, if there are additional edges that cannot
+be added to the block, the new edges are separately queued, a new edge block of a larger size is allocated,
+the old adjacencies and the additional edges are added to the new block, and the old block is reclaimed.
+Similarly, on the deletion of an edge, if the number of valid edges in a block becomes smaller than half its
+capacity, these edges are migrated to a smaller block, and the original block is reclaimed.
+In Hornet, the
+edges to be processed are divided equally among thread blocks and equally among the threads within the
+thread block. Since all threads within a warp have the same number of edges to process, warp divergence
+is avoided. However coalesced memory access is not obtained in Hornet.
+6
+Experimental Evaluation
+Graph
+#Nodes
+#Edges
+Average
+Maximum
+Maximum
+Memory Allocation
+Degree
+Degree
+Diameter
+in SlabHash
+in Meerkat
+LJournal [8]
+4.85M
+69M
+14
+20293
+16
+2.56
+0.97
+Rand10M
+10M
+80M
+8
+27
+11
+4.92
+1.34
+BerkStan [26]
+685K
+7.6M
+11
+249
+573
+0.48
+0.25
+Wiki-talk [25]
+2.4M
+5M
+2
+100022
+9
+1.32
+0.46
+Wikipedia
+3.4M
+93.4M
+27
+5333
+262
+2.02
+1
+Orkut [39]
+3.1M
+234.4M
+76
+33313
+9
+2.37
+1.69
+USAfull [1]
+23.9M
+58.3M
+2
+9
+6261
+OOM
+6.1
+Table 5: Input Graphs and Memory Requirement (in GiB) in Meerkat
+The experimental evaluation was performed on an NVidia RTX 2080 Ti GPU. The GPU is equipped
+with 11GB of global memory with a memory bandwidth of 616GB/s, and 4352 CUDA Cores (68 SMs and 64
+cores/SM). All the implementations were compiled with -O3 and –use_fast_mathﬂags on the nvcc version
+11.7 compiler. Table 5 shows the seven publicly available graphs used for our comparison of the static and
+dynamic graph algorithms, their average/maximum vertex degrees, and their maximum diameters.
+The last two columns of the Table 5 compare the memory space requirements (in GiB)when the memory
+allocation for the graph is performed inside SlabHash objects versus inside the dynamic graph in the
+Meerkat framework. We observe 1.4 −3.67× (2.33× on an average) of memory savings by using the latter
+strategy. When the memory allocation is handled inside SlabHash, the number of cudaMalloc() calls are
+equal to the number of slab-lists, which is at least the total number of vertices in the input graph object,
+resulting in signiﬁcantly large memory consumption. The Meerkat framework moves the responsibility
+of allocating the head slabs from SlabHash to the SlabGraph object, which decides the number of slabs
+required per vertex according to the load factor. A single large array of head slabs is allocated using a
+single cudaMalloc() function call, resulting in better memory utilization.
+We evaluate our implementation for ﬁve dynamic graph algorithms: Breadth First Search (BFS), Single
+Source Shortest Path (SSSP), Triangle Counting (TC), PageRank (PR), and Weakly Connected Components
+(WCC). We have compared the performance of the static versions of these algorithms on Meerkat against
+Hornet, a dynamic graph data structure for GPU. The Hornet data structure comes with the implemen-
+tation of static graph algorithms on full graphs and does not have implementations for incremental and
+18
+
+=== PAGE 19 ===
+decremental dynamic graph algorithms 5. For the comparison of the performance beneﬁt of our dynamic al-
+gorithms over their static counterparts, we computed the self-relative-speedup over Meerkat. We deﬁne the
+following quantity: 푠푛
+푏=
+푠푡푎푡푖푐푛
+푏
+푑푦푛푎푚푖푐푛
+푏. 푠푡푎푡푖푐푛
+푏is the cumulative execution times of the static algorithm applied
+for a sequence of 푛incremental/decremental edge updates of size 푏, measured after each batch. 푑푦푛푎푚푖푐푛
+푏
+is the cumulative execution times of the incremental/decremental algorithm applied for the same sequence
+of 푛incremental/decremental edge updates of size 푏, measured after each batch. We deﬁne 푠푛
+푏, the speedup
+of the incremental/decremental algorithm over the static algorithm, as the ratio of 푠푡푎푡푖푐푛
+푏to 푑푦푛푎푚푖푐푛
+푏. We
+have reported speedups 푠10
+10푘for our dynamic BFS, SSSP, PageRank, and Triangle Counting algorithms
+in Figures 7a, 7b, 8b, and 11b, respectively.
+The warp-cooperative execution strategy (WCWS) adopted by Meerkat framework in insertion, dele-
+tion, query operations, and in our algorithms require that warp-divergence be avoided. The data is ex-
+changed among threads using warp-cooperative functions such as ballot_sync, ffs, etc., which are
+fast as they work only with registers. In WCWS, multiple threads within a warp thread have diﬀerent
+tasks (vertices/edges) assigned to them. The warp threads form a queue for processing these tasks (using
+ballot_sync);a task to be processed is collectively elected by the warp (using ffs). Each slab occupies 128
+bytes, which closely matches the GPU’s 퐿1 cache line size. All warp threads perform coalesced vectorized
+memory accesses on a slab storing a vertex’s adjacent neighbors. In Hornet, the load balance is achieved
+by sequentially distributing edges equally among all the threads spawned for the kernel grid. However,
+this method aﬀects the coalesced memory access resulting in poorer performance.
+Orkut
+USAfull
+LJournal Rand10M BerkStan Wikipedia Wiki-talk
+5
+10
+15
+18.04
+35.04
+8.35
+22.52
+14.45
+0.78
+4.06
+9.56
+13.36
+12.18
+7.9
+11.28
+10.35
+9.91
+5.02
+9.82
+6.64
+4.31
+6.6
+6.44
+4.99
+4.78
+7.6
+5.75
+3.98
+5.77
+5.35
+4
+Speedup
+Bulk Insert
+8K
+4K
+2K
+Figure 3: Insertion - Speedup Over Hornet
+As described in Section 5, Hornet migrates the adjacent neighbors of a vertex to a larger edge block
+if the current block cannot accommodate the incoming edges. In the case of deletion, if the adjacent edges
+are fewer than a threshold, the edges are migrated to a smaller block. This migration of adjacent neighbors
+does not happen in Meerkat. For every new edge ⟨푢,푣⟩to be inserted, Meerkat applies a hashing function
+on the destination vertex 푣, to choose which slab-list of the source vertex 푢must store its neighbor 푣.
+An edge is stored at the end of the slab list, if it is not already present in the slab list. This requires a
+traversal till the end of the slab list to check for previously added identical edges. Hashing distributes the
+destination vertices among multiple slab lists, implicitly reducing the number of slabs to be retrieved for
+checking duplication. If the last slab in the slab list cannot accommodate a new edge, Meerkat obtains a
+new slab from the pool of pre-allocated slabs, by invoking the slab allocator. The new slab is linked to the
+end of the slab list, and the new edge is recorded in it.
+5We
+were
+unable
+to
+compare
+cuSTINGER
+[19]
+with
+our
+work,
+since
+the
+publicly
+available
+source
+code
+(https://github.com/cuStinger/cuStinger) does not compile for our GPU’s architecture (with CUDA compute capability 7.5).
+19
+
+=== PAGE 20 ===
+Orkut
+USAfull
+LJournal Rand10M BerkStan Wikipedia Wiki-talk
+5
+10
+15
+8.6
+12.3
+2.2
+3.1 · 10−1
+17.7
+1.4
+8.9
+15.8
+17.4
+18.1
+12.2
+16.5
+14.7
+15.1
+11.8
+11.7
+11.2
+8.7
+11.5
+10.7
+9.9
+12.3
+11.7
+11.4
+8.9
+11.7
+10.9
+9.5
+Speedup
+Bulk Delete
+8K
+4K
+2K
+Figure 4: Deletion - Speedup Over Hornet
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+5
+10
+15
+5.18
+0.9
+24.12
+1.88
+1.03
+4.31
+116.95
+6.53
+1.08
+14.2
+2.61
+1.01
+4.81
+98.52
+3.96
+1.17
+8.2
+2.51
+1
+3.46
+73.86
+3.46
+1.23
+5.06
+2.2
+0.98
+3.25
+64.53
+2.6
+1.26
+3.59
+2.03
+0.98
+2.94
+59.47
+Speedup
+216
+217
+218
+219
+220
+Figure 5: Query - Speedup Over Hornet
+Figure 3 compares the insertion throughput of loading an entire graph, and for small-batch insertions
+(2K,4K,8K). Meerkat, for small batch insertions of 2K,4K,8K, performs 3.7×-11.04× better than Hornet.
+Figure 5 compares the performance of a query benchmark for batches of randomly generated edges, of sizes
+ranging from 216 to 220. On average, Meerkat performs 2.16-6.37× better than Hornet. Figure 4 compares
+the throughput of the deletion operation for the whole graph and small batches (2K,4K,8K). For small
+batch deletions, Meerkat performs 10.48×-16.15× better than Hornet. The performance improvement is
+due to better coalesced memory accesses, and lack of memory block migrations in Meerkat. The deletion
+benchmark shows better performance as the deletion operation only ﬂips a valid entry to TOMBSTONE_KEY.
+Unlike the insertion operation, the adjacent neighbor to be deleted could occur anywhere within a slab
+list. The traversal of the slab list halts once the incident edge to be deleted is found. The insertion opera-
+tion requires adding new slabs once a slab list becomes full. In the Meerkat framework, each thread in a
+warp processes slabs holding neighbors of the same vertex, resulting in better load balance and coalesced
+memory access.
+Disabling hashing has a direct consequence in improving slab occupancy, especially in graphs that
+have a high average out-degree (such as Orkut, Higgs, and Wikipedia). On disabling hashing, the average
+slab occupancy improved by 24% for Orkut, 14.35% for Higgs, 8% for Pokec, and 5% for LJournal, with an
+overall 6.26% improvement across all our benchmark graphs. In traversal algorithms such as BFS, SSSP,
+PageRank, and WCC, where retrieving all neighbours of a vertex is of interest, it is compulsory to visit all
+slabs associated with the vertex. The improvement in slab occupancy has two direct consequences. Firstly,
+fewer slabs per vertex translate to fewer memory accesses needed to retrieve all its neighbours. Secondly,
+more neighbours of a vertex are retrieved per slab, resulting in better workload for warps.
+20
+
+=== PAGE 21 ===
+If the operation of interest is SearchEdge(), enabling hashing gives a performance improvement. This
+happens with the Triangle Counting algorithm. Enabling hashing distributes the neighbours of a vertex
+among several slab lists, reducing the length of a single slab list. Out of the several slab lists associated
+with a vertex, it is suﬃcient to look at the one which could be holding the neighbouring vertex we are
+looking for. The slabs in other slab lists need not be inspected in the query operation due to hashing.
+6.1
+BFS and SSSP
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+0.5
+1
+1.5
+2
+1.03
+1.82
+0.95
+1.16
+1.72
+1.29
+0.58
+0.72
+1.77
+0.81
+1.12
+1.72
+1.05
+0.53
+Speedup
+BFS vanilla
+BFS - tree
+(a) Static BFS - Speedup Over Hornet
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+0.5
+1
+1.5
+1.4
+1.53
+1.54
+1.65
+1.44
+1.04
+0.58
+1.07
+1.38
+1.47
+1.6
+1.46
+0.94
+0.55
+Speedup
+SSSP vanilla
+SSSP - tree
+(b) Static SSSP - Speedup Over Hornet
+Figure 6: Static BFS / SSSP
+The BFS and SSSP algorithms are programmed in Meerkat using two approaches. The vanilla im-
+plementation uses 32-bit atomics and the tree-based implementation uses 64-bit atomics. The vanilla
+implementation computes only the shortest distances for the reachable vertices from the source vertex.
+The tree variant, however, also computes a dependency tree tracking how these distances have been
+computed. The maintenance of this dependency tree is necessary for correct working of our incremen-
+tal/decremental BFS and SSSP algorithms. The BFS and SSSP algorithms in Meerkat and Hornet follow
+an iterative approach using a pair of frontiers [18].
+Disabling hashing for the BFS algorithm produces an average of 10.78% improvement (up to 28.1%) in
+performance. Similarly, an average of 9.1% improvement (up to 23.28%) for tree-based variant. Similarly,
+disabling hashing for the SSSP benchmark produces an average of 9.9% improvement (upto 35%). The
+tree-based variant shows a similar average improvement of 11% (upto 28.95%).
+6.1.1
+Static BFS and SSSP comparion with Hornet
+The Figure 6a shows the speedup of the static vanilla and the tree-based implementation of BFS algo-
+rithm in Meerkat over the static implementation in Hornet. The Figure 6b shows the speedup of the static
+Vanilla and tree-based SSSP algorithm on Meerkat against that of Hornet. The tree-based approach
+is necessary for setting up the initial data structures for incremental/decremental variants of our BFS/SSSP
+implementations on Meerkat. Our vanilla BFS algorithm on Meerkat is on an average, 1.17× (upto 1.82×)
+faster than that of Hornet. The vanilla SSSP algorithm on Meerkat is on average, 1.32× (upto 1.85×)
+21
+
+=== PAGE 22 ===
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+5
+10
+15
+112.28
+0.41
+45.65
+77.37
+1.57
+11.52
+76.42
+3.88
+0.24
+2.86
+1.78
+5.33
+3.41
+2.49
+Speedup
+Incremental
+Decremental
+(a) Speedup 푠10
+10푘over Static BFS
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+10
+20
+1,227.05
+1.53
+180.8
+166.2
+3.65
+68.04
+106.67
+15.05
+0.72
+11.62
+7.96
+9.45
+11.42
+3.21
+Speedup
+Incremental
+Decremental
+(b) Speedup 푠10
+10푘over Static SSSP
+Figure 7: Dynamic BFS and SSSP on Meerkat
+faster than Hornet’s implementation. The reasons for the speedup in Meerkat are better-coalesced access
+memory access, and lack of migration of memory blocks.
+The tree-based BFS and SSSP algorithm on Meerkat, in contrast to the vanilla implementations
+initialize tree-nodes (a 64-bit sized ⟨푑푖푠푡푎푛푐푒푆푅퐶,parent⟩pair) using 64-bit atomics. The tree-based BFS
+has an average overhead of 17.2% over the vanilla version, seen in the execution time. A similar overhead
+of ≈14% was seen in the case of tree-based SSSP.
+6.1.2
+Dynamic BFS and SSSP in Meerkat
+Figures 7a and 7b show the푠10
+10푘incremental and decremental speedups with respect to the static algorithms
+on Meerkat, for dynamic BFS and SSSP algorithms, respectively. The incremental BFS and SSSP are bound
+to be faster than the decremental algorithm. The incremental BFS and SSSP are performed by choosing the
+input batch of edges as the initial frontier and iterative application of the static algorithm to recompute the
+tree. The decremental variant involves invalidation of aﬀected vertices in the tree, the propagation of
+invalidation up the tree, computation of the initial frontier from unaﬀected vertices and re-computation
+of the tree invariant by iterative application of the static algorithm.
+With the exception of USAfull and BerkStan graph inputs, the execution times of the repeated appli-
+cation of the static algorithm were on an average 7.3% and 5.6% lower than the static running times on the
+original graph, for incremental BFS and incremental SSSP, respectively. For USAfull and BerkStan graphs,
+this diﬀerence was close to 80% and 71% respectively. In the case of incremental BFS on USAfull, we ob-
+served that there was a 11.53× decrease in the average distance after the addition of ﬁrst 10K, and nearly
+2× decrease from the ﬁrst to the tenth batch. The USAfull is fully connected and, hence, no increase in the
+number of reachable vertices was observed. In the case of BerkStan, while the average distance decreased
+from 11.7 to 8.58 for our sequence of ten incremental batches of 10K, we observed that the number of
+reachable vertices increased from ≈460K to ≈591K. Due to their graph topology, the speedup for incremen-
+tal BFS and SSSP for USAfull and BerkStan, was much lower compared to the other graphs. There was no
+signiﬁcant increase in the number of reachable vertices or decrease in the the average distance for other
+22
+
+=== PAGE 23 ===
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+1
+2
+3
+1.35
+2.03
+1.52
+2.95
+0.4
+1.18
+1.79
+Speedup
+(a) Static PageRank - Speedup Over Hornet
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+2
+4
+6
+8
+6.27
+2.88
+4.75
+1.59
+2.08
+6.13
+3.25
+9.31
+3.46
+5.52
+1.59
+2.77
+8.63
+2.72
+Incremental
+Decremental
+(b) Speedup 푠10
+10푘over Static PageRank
+Figure 8: Static / Dynamic PageRank
+benchmark graphs.
+In the case of decremental BFS and SSSP, the number of edges in the dependence tree that have been
+invalidated depends on the average in-degree of a vertex. We observed that for low average-in-degree
+graphs, likelihood of tree-edges being invalidated was higher than those of high in-degree graphs. For
+example, in the case of decremental BFS for a sequence of ten 10K batches, for USAfull graph (with an
+average in-degree 2), an average of 38.97% of the decremental batch were tree edges, while it was 0.769%
+of the decremental batch for Orkut (with an average in-degree 72). It needs to be noted that the depth of
+the dependence tree is the BFS distance. Smaller tree-depth (BFS distance) and large average degree favors
+only fewer vertices to be invalidated. In our observation for decremental BFS for 10K batches, we saw an
+average of 0.23K vertices for Orkut, 0.4K for Wikipedia, 1K for LJournal, 3.94K for BerkStan, 6K vertices
+for Rand10M, whose distances were invalidated, while it was an average of 9.54M vertices for USAfull,
+after each batch. This explains why USAfull graph performs poorly with our decremental BFS and SSSP
+algorithms. In the case of BerkStan graph, we have seen decrease in the average distance for successive
+decremental batches, while other graphs have shown a marginally increasing trend in the average distance
+for successive decremental batches. The number of reachable vertices reduced by ≈2% after ten batches
+for BerkStan, resulting in higher speedups. Rand10M and Orkut did not show any decrease in reachable
+vertices, while the decrease was on an average 0.047% (upto 0.18% for USAfull) for other graphs.
+6.2
+PageRank
+For our experimental evaluation of PageRank, we have set the damping factor to be 0.85, and the error
+margin to be 0.00001. The computation of PageRank (See Algorithm 5) involves the traversal of neighbors
+of each vertex, along their incoming edges. Disabling hashing improves the slab occupancy, especially in
+graphs with a higher average in-degree. For low average in-degree graphs such as USAfull (2), Rand10M
+(8), and Wiki-talk (2), there is no performance improvement, as disabling hashing has virtually no eﬀect:
+most vertices owing to their low indegree have single slab lists. However, for large average indegree graphs
+such as Orkut (76) and Wikipedia (27), disabling hashing produces a speedup of about 1.36-1.62× for the
+static PageRank algorithm.
+23
+
+=== PAGE 24 ===
+2
+4
+6
+8
+Iterations
+Orkut
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+40
+60
+80
+100
+120
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+Orkut
+5
+10
+15
+20
+Iterations
+USAfull
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+200
+300
+400
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+USAfull
+2
+4
+6
+8
+10
+12
+Iterations
+LJournal
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+50
+60
+70
+80
+90
+100
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+LJournal
+10
+20
+30
+Iterations
+BerkStan
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+100
+120
+140
+160
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+BerkStan
+2
+4
+6
+8
+10
+Iterations
+Wikipedia
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+40
+60
+80
+100
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+Wikipedia
+2
+4
+6
+8
+10
+Iterations
+Wiki-talk
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+12
+14
+16
+18
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+Wiki-talk
+Figure 9: PageRank (incremental - small batches)
+6.2.1
+Comparison of Static implementation with Hornet
+Figure 8a compares the performance of static PageRank on Meerkat, with that of Hornet. It is observed
+that in six out of seven graphs(that is, except Rand10M), Meerkat performs 1.18-2.49× (with an average
+of 1.74×) faster than Hornet. The PageRank implementation on both Meerkat and Hornet are traversal
+based algorithms. Each iteration applies the computation of PageRank on all vertices. The number of
+iterations depends on when the convergence is achieved based on the convergence strategy. The perfor-
+mance improvement in Meerkat can be attributed to our eﬃcient iterators performing coalesced accesses
+in retrieving adjacent vertices. While Hornet attempts to avoid warp-divergence, its traversal mechanism
+does not perform coalesced memory accesses.
+6.2.2
+Speedup of Dynamic Implementation in Meerkat
+The incremental and decremental algorithms are identical: the same static-PageRank algorithm is ap-
+plied on the entire graph after performing insertion/deletion of edges, respectively. Figure 9 and Figure 10
+show the average running time (in ×) and the average number of iterations (in ◦) for small incremen-
+tal/decremental batches ranging from 1K to 10K, respectively. We observe an increasing trend in the exe-
+cution time as the batches increase in size. The trend in the execution time bears a striking resemblance
+with the number of iterations. The number of vertices, whose PageRank values are invalidated, increases
+with the batch size.
+Since all vertices participate in the computation of incremental/decremental PageRank, the running
+time must depend on the number of vertices. Further, the average execution time per iteration increases
+with the increase in the number of vertices. USAfull has the highest number of vertices and exhibits the
+24
+
+=== PAGE 25 ===
+1
+2
+3
+4
+5
+Iterations
+Orkut
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+40
+50
+60
+70
+80
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+Orkut
+5
+10
+15
+20
+Iterations
+USAfull
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+150
+200
+250
+300
+350
+400
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+USAfull
+2
+4
+6
+8
+10
+Iterations
+LJournal
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+40
+50
+60
+70
+80
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+LJournal
+5
+10
+15
+20
+25
+Iterations
+BerkStan
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+60
+80
+100
+120
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+BerkStan
+2
+4
+6
+Iterations
+Wikipedia
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+40
+50
+60
+70
+80
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+Wikipedia
+2
+4
+6
+8
+10
+12
+Iterations
+Wiki-talk
+1K 2K 3K 4K 5K 6K 7K 8K 9K 10K
+15
+20
+25
+Batch Size (K = 103)
+Avg. Running Time (in ms.)
+Wiki-talk
+Figure 10: PageRank (decremental - small batches)
+highest running time among all graphs. Rand10M also has a high running time for similar reasons. Across,
+the incremental (decremental) batches, BerkStan has 1.8(1.57)× higher number of iterations compared
+to USAfull, respectively. BerkStan has a smaller number of vertices but a higher diameter compared to
+other graphs. Owing to their small diameters, Orkut, LJournal, Pokec, and Rand10M converge with fewer
+iterations, and show the slowest growth across 1K to 10K.
+Figure 8b shows the 푠10
+10푘incremental/decremental speedups with respect to the static algorithms on
+Meerkat. The speedups are directly proportional to the measure by which fewer iterations are required un-
+til convergence is achieved. For batches of 10K edges, we observed that Orkut achieved convergence with
+≈20% and ≈13% of iterations required for the static variant, for incremental and decremental algorithms,
+respectively. Whereas, the Rand10M converged in ≈64% of iterations compared to the static variant, for
+incremental and decremental algorithms, registering the smallest speedups.
+6.3
+Triangle Counting
+Figure 11a compares the performance of the static triangle counting algorithm on Meerkat against Hor-
+net. Hornet performs on an average 31.12× (upto 59.34×) faster than that of Meerkat on our benchmark
+graphs. The implementation of triangle counting on Hornet pre-processes the input batch, sorting the
+edges so that adjacent neighbours of every vertex can be accessed in ascending order. This ordering of
+edges is beneﬁcial for performing intersections of the adjacencies of the endpoints of an edge. In Hornet,
+all the neighbours of a vertex are contiguously available within an edge block, whose size is the smallest
+power of two greater than the number of adjacent neighbours. Hornet divides the edges into multiple
+bins. In each bin, edges have the same estimated eﬀort for performing an intersection of the adjacencies
+25
+
+=== PAGE 26 ===
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+20
+40
+60
+59.34
+1.39
+28.73
+5.61
+18.93
+53.13
+50.9
+Slowdown
+(a) Static Triangle Counting - Slowdown over Hor-
+net
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+1,000
+2,000
+15,853.86
+302.39
+6,820.55
+4,289.24
+540.57
+16,311.18
+2,899.25
+7,326.86
+384.13
+2,812.72
+4,465.86
+196.87
+5,043.59
+369.09
+Speedup
+Incremental
+Decremental
+(b) Speedup 푠10
+10푘over Static Triangle Counting
+Figure 11: Static / Dynamic Triangle Counting on Meerkat
+of their endpoints. Each bin of edges is processed in a separate kernel invocation so that proper load bal-
+ancing is achieved among the kernel threads. Hornet uses two methods for performing the intersection
+of the adjacencies of the endpoints of the edges, which are dependent on their storage in ascending or-
+der. In the ﬁrst method, Hornet chooses the endpoint having the smallest adjacency list of the two. It
+traverses through the vertices in this adjacency list and counts the membership in the adjacency list of
+the other vertex, by using binary search. The second method is based on a simultaneous traversal of both
+the adjacency lists. A pointer is associated with each adjacency list; the pointer is advanced if it points
+to an element smaller than that referred to by the other pointer. The intersection count is incremented
+if both the pointers refer to the same element. The drawback of forcing an ascending order among the
+adjacencies for each vertex is that it makes the Hornet graph object unsuitable for the triangle counting
+re-computation after insertion/deletion of edges.
+In contrast, the presence of hashing in Meerkat distributes the adjacent vertices among multiple slabs,
+and the ordering among elements cannot be enforced. The Meerkat framework cannot use eﬃcient meth-
+ods which Hornet can use due to this lack of ordering of edges. In Meerkat, for each edge 푢→푣(assum-
+ing 푢has a smaller adjacency than 푣without loss of generality), the slabs of 푢are ﬁrst traversed with the
+help of our iterators. For each vertex 푤adjacent to 푢retrieved by our iterators, the SearchEdge() device
+method checks for the existence of 푤in the adjacencies of 푣. This is achieved by identifying the slab list
+using hashing with vertex 푤to identify the slab list that could potentially hold 푤, and by traversing the
+slab list to discover the vertex 푤. Enabling hashing for the Triangle Counting benchmark improves the
+performance by 15.44× on our benchmark graphs.
+Figure 11b shows the푠10
+10푘speedup of our incremental/decremental algorithms over the static algorithms
+on Meerkat. Across the benchmarks, superlative speedups are observed since, for each batch, the static
+algorithm counts the number of triangles by performing an intersection for the adjacencies of both end-
+points for every graph edge, while the dynamic algorithm performs intersection only for the end-points
+of the edges in the batch. The speedup observed is very large if the batch size is very small compared to
+26
+
+=== PAGE 27 ===
+the number of edges in the graph. Hence, graphs such as Orkut, LJournal, Rand10M, and Wikipedia enjoy
+very high speedups compared to the repeated application of the static algorithm.
+6.4
+Weakly Connected Component (WCC)
+We evaluate the performance of the static WCC algorithm on Meerkat against Hornet, followed by, the
+performance of incremental WCC in Meerkat for various optimizations. The decremental WCC on GPU,
+at the time of writing, is an unsolved problem.
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+1
+2
+3
+4
+0.96
+23.55
+1.71
+1.88
+20.01
+1.55
+0.66
+Speedup
+(a) Static WCC - Speedup Over
+Hornet
+Orkut
+USAfull
+LJournal
+Rand10M
+BerkStan
+Wikipedia
+Wiki-talk
+0
+50
+100
+150
+103.8
+33.9
+42.6
+165.4
+8.8
+28.9
+22.1
+80.5
+34.1
+15.4
+144.6
+8.8
+22.7
+13.9
+29.3
+34.1
+11.1
+168.5
+8.1
+22.7
+9.4
+Speedup
+2K
+4K
+8K
+(b) Incr. WCC using UpdateIterator + Single Bucket - Speedup Over
+Naive
+Figure 12: Weakly Connected Components
+6.4.1
+Static WCC in Meerkat vs. Hornet
+Figure 12a compares the performance of static WCC on Meerkatagainst Hornet. Hornet uses a modiﬁed-
+BFS like algorithm discovering connected components, using a two-level queue. With a two-level queue,
+the insert()and deque()operations are performed on two separate queues. In the ﬁrst step, the discovery
+of the largest connected component is attempted. A BFS is performed from the source vertex with the help
+of a two-level queue, and all the reachable vertices are marked with the same color. In the second step, all
+the unvisited vertices are incrementally assigned a unique color. In the third step, the edges from these
+unreachable vertices are queued, and both end-points are iteratively assigned the smallest of their colors.
+This iterative process continues until all the endpoints of such edges have the same color. In Meerkat, the
+static WCC implementation uses the union-ﬁnd approach for discovering weakly-connected components.
+It performs a single traversal through all the adjacencies of the graph: it uses the Union-Async strategy
+for the union operation for the adjacent edges discovered, and full path compression for determining the
+representative elements for the vertices in find operation.
+We observe that while Meerkat performs 6.08× on an average across all our input graphs, the speedup
+against Hornet is lower if there are vertices with very large out-degree. This is observed in graphs such
+as Orkut, LJournal, and Wikipedia. This is because a large-out degree vertex will cause many vertices to
+be enqueued into the BFS frontier queue, thereby improving parallelism. However, for networks such as
+27
+
+=== PAGE 28 ===
+USAfull, BerkStan, the diameter of such graphs is much higher, the BFS-approach in Hornet performs
+signiﬁcantly worse compared to Meerkat.
+6.4.2
+Incremental WCC in Meerkat
+Incremental WCC is evaluated with diﬀerent schemes.
+• Naive: traverses through all the slab lists as it is ignorant about the location of the new updates.
+Hence, it is expected to be the least performant implementation. This algorithm is identical to the
+naive static WCC algorithm on SlabGraph.
+• SlabIterator: maintains a boolean ﬂag for every vertex. This ﬂag is set to true for a vertex if there
+are new adjacent vertices in the input batch. All the neighboring adjacencies of such a vertex are
+traversed. This bears the potential to signiﬁcantly reduce the need to visit a large number of source
+vertices, especially when the batch size is small compared to the current graph, and when a source
+vertex is shared by a signiﬁcant majority of batch update edges.
+• UpdateIterator: apart from maintaining a boolean ﬂag to identify source vertices with adjacencies,
+this implementation maintains an update ﬂag for every slab list and the allocator address of the ﬁrst
+updated slab. Unlike the SlabIterator, UpdateIterators allow visitation of only those slabs storing the
+new updates. ﬂag along with the UpdateIterator.
+• UpdateIterator + Single Bucket: Evaluates the UpdateIterator approach in the absence of hashing.
+Intuitively, this should ensure that a warp operating on an UpdateIterator would see more updates in
+single memory access while traversing a slab list. This method produced the highest speedup with
+respect to the Naive variant .
+Method
+Dataset
+2K
+4K
+8K
+SlabIterator
+LJournal
+40.5×
+12.3×
+10.9×
+Rand10M
+149.8× 170.4× 146.9×
+BerkStan
+9.55×
+9.98×
+9.03×
+Wiki-talk
+18.3×
+8.62×
+7.37×
+Wikipedia 23.65× 18.19× 18.07×
+Orkut
+82.3×
+62.9×
+20.5×
+USAfull
+33.9×
+34.3×
+34.0×
+UpdateIterator
+LJournal
+34.6×
+8.36×
+7.58×
+Rand10M
+149.0× 146.8× 144.7×
+BerkStan
+7.71×
+7.82×
+7.34×
+Wiki-talk
+15.8×
+7.27×
+6.37×
+Wikipedia 19.56× 15.34× 15.08×
+Orkut
+71.0×
+52.9×
+17.0×
+USAfull
+33.9×
+34.0×
+33.6×
+Table 6: Incremental WCC: Speedup over the naïve scheme
+Figure 12b compares the performance of UpdateIterator + Single Bucket against the naïve scheme, while
+a similar comparison of the SlabIterator and UpdateIterator schemes is shown in Table 6. It must be remem-
+bered that the naïve scheme cannot distinguish between the updated slabs, and those slabs holding adja-
+cent vertices previously inserted. Hence, its running time is proportional to the number of edges present
+in the graph representation. Our optimized processing iterates over only the updated slabs (UpdateIterator,
+28
+
+=== PAGE 29 ===
+UpdateIterator + Single Bucket)/slab-lists (SlabIterator); therefore, the running time is proportional to the
+number of slabs/slab lists holding new updates, respectively. Hence, the speedup decreases with increasing
+batch size.
+The use of a update ﬂag for vertex contributes signiﬁcantly to eliminating the traversal of the adjacen-
+cies of the source vertices which do not have updated slab lists. Almost identical performance is observed
+between the UpdateIterator and the UpdateIterator + Single Bucket schemes for low-degree graphs such
+as USAfull. If the average degree of a vertex is less than a slab’s capacity, only one slab list (one head
+slab) would be allocated per vertex, and most updates would thus ﬁt the head slab comfortably. The extra
+overhead visible in the fourth major row would be attributed to checking the slab list’s update ﬂag. In
+high-degree graphs such as social networks (namely, Orkut, Wikipedia, and Wiki-talk), the UpdateIterator
+over a single bucket overcomes previously inserted vertices, with the updates restricted contiguously to a
+single slab list, resulting in a marginal increase in performance. However, the use of UpdateIterator with
+the vertex ﬂag and the allowance of multiple slab lists seems to have lower performance than the use of a
+single slab list for high-degree graphs that follow the power-law distribution: Orkut, Wikipedia, and Wiki-
+talk. In the presence of multiple slab lists, the UpdateIterator must sequentially probe if the update ﬂag for
+a slab list is set for every slab list of the source vertex. This overhead is overcome in the use of a single
+slab list by subsuming the function of the update ﬂag of a slab list within that for the source vertex.
+7
+Conclusion and Future Work
+We presented a new framework Meerkat for dynamic graph algorithms on GPUs. It builds upon and sig-
+niﬁcantly enhances a hash-based SlabHash data structure. Meerkat oﬀers a memory-eﬃcient alternative,
+proposes new iterators, and optimizes their processing to improve on both the execution time as well as the
+memory requirement. These enhancements allow dynamic graph algorithms, containing both incremental
+and decremental updates, to be implemented eﬃciently on GPUs. We illustrated the eﬀectiveness of the
+framework using fundamental graph algorithms: BFS, SSSP, PR, TC, and WCC, and fundamental graph op-
+erations: insert, delete, and query. As part of future work, we would like to implement more complex
+graph algorithms using our framework, and also check for the feasibility of approximations to reduce the
+memory requirement of Meerkat further.
+References
+[1] 9th dimacs implementation challenge - shortest paths.
+http://www.diag.uniroma1.it/
+/challenge9/download.shtml, May 2013.
+[2] Acar, U. A., Anderson, D., Blelloch, G. E., and Dhulipala, L. Parallel batch-dynamic graph con-
+nectivity. In The 31st ACM Symposium on Parallelism in Algorithms and Architectures (New York, NY,
+USA, 2019), SPAA ’19, Association for Computing Machinery, pp. 381–392.
+[3] Afarin, M., Gao, C., Rahman, S., Abu-Ghazaleh, N., and Gupta, R. Commongraph: Graph analytics
+on evolving data. In Proceedings of the 28th ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems, Volume 2 (New York, NY, USA, 2023), ASPLOS 2023,
+Association for Computing Machinery, pp. 133–145.
+[4] Arasu, A., Novak, J., Tomkins, A., and Tomlin, J. A. Pagerank computation and the structure of the
+web: Experiments and algorithms.
+29
+
+=== PAGE 30 ===
+[5] Ashkiani, S., Farach-Colton, M., and Owens, J. D. A dynamic hash table for the gpu. In 2018 IEEE
+International Parallel and Distributed Processing Symposium (IPDPS) (2018), pp. 419–429.
+[6] Ashkiani, S., Farach-Colton, M., and Owens, J. D. A dynamic hash table for the gpu. In 2018 IEEE
+International Parallel and Distributed Processing Symposium (IPDPS) (2018), pp. 419–429.
+[7] Awad, M. A., Ashkiani, S., Porumbescu, S. D., and Owens, J. D. Dynamic graphs on the gpu. In
+2020 IEEE International Parallel and Distributed Processing Symposium (IPDPS) (2020), pp. 739–748.
+[8] Backstrom, L., Huttenlocher, D., Kleinberg, J., and Lan, X. Group formation in large social
+networks: Membership, growth, and evolution. In Proceedings of the 12th ACM SIGKDD International
+Conference on Knowledge Discovery and Data Mining (New York, NY, USA, 2006), KDD ’06, Association
+for Computing Machinery, pp. 44–54.
+[9] Bender, M. A., and Hu, H. An adaptive packed-memory array. In Proceedings of the Twenty-Fifth
+ACM SIGMOD-SIGACT-SIGART Symposium on Principles of Database Systems (New York, NY, USA,
+2006), PODS ’06, Association for Computing Machinery, pp. 20–29.
+[10] Busato, F., Green, O., Bombieri, N., and Bader, D. A. Hornet: An eﬃcient data structure for dynamic
+sparse graphs and matrices on gpus. In 2018 IEEE High Performance extreme Computing Conference
+(HPEC) (2018), pp. 1–7.
+[11] Chen, D., Gui, C., Zhang, Y., Jin, H., Zheng, L., Huang, Y., and Liao, X. Graphﬂy: Eﬃcient asyn-
+chronous streaming graphs processing via dependency-ﬂow. In Proceedings of the International Con-
+ference on High Performance Computing, Networking, Storage and Analysis (2022), SC ’22, IEEE Press.
+[12] De Leo, D., and Boncz, P. Teseo and the analysis of structural dynamic graphs. Proc. VLDB Endow.
+14, 6 (feb 2021), 1053–1066.
+[13] Dhulipala, L., Blelloch, G. E., and Shun, J. Low-latency graph streaming using compressed purely-
+functional trees.
+In Proceedings of the 40th ACM SIGPLAN Conference on Programming Language
+Design and Implementation (New York, NY, USA, 2019), PLDI 2019, Association for Computing Ma-
+chinery, p. 918–934.
+[14] Dhulipala, L., Hong, C., and Shun, J. Connectit: A framework for static and incremental parallel
+graph connectivity algorithms. Proc. VLDB Endow. 14, 4 (dec 2020), 653–667.
+[15] Ediger, D., McColl, R., Riedy, J., and Bader, D. A. Stinger: High performance data structure for
+streaming graphs. In 2012 IEEE Conference on High Performance Extreme Computing (2012), pp. 1–5.
+[16] Fagerberg, R. Cache-Oblivious B-Tree. Springer US, Boston, MA, 2008, pp. 121–123.
+[17] Fuchs, P., Margan, D., and Giceva, J. Sortledton: A universal, transactional graph data structure.
+Proc. VLDB Endow. 15, 6 (feb 2022), 1173–1186.
+[18] Gogoi, B., Cheramangalath, U., and Nasre, R. Custom code generation for a graph dsl. In Proceed-
+ings of the 13th Annual Workshop on General Purpose Processing Using Graphics Processing Unit (New
+York, NY, USA, 2020), GPGPU ’20, Association for Computing Machinery, p. 51–60.
+[19] Green, O., and Bader, D. A. custinger: Supporting dynamic graph algorithms for gpus. In 2016 IEEE
+High Performance Extreme Computing Conference (HPEC) (2016), pp. 1–6.
+30
+
+=== PAGE 31 ===
+[20] Hong, C., Dhulipala, L., and Shun, J. Exploring the design space of static and incremental graph
+connectivity algorithms on gpus. In Proceedings of the ACM International Conference on Parallel Archi-
+tectures and Compilation Techniques (New York, NY, USA, 2020), PACT ’20, Association for Computing
+Machinery, pp. 55–69.
+[21] Jaiganesh, J., and Burtscher, M. A high-performance connected components implementation for
+gpus. In Proceedings of the 27th International Symposium on High-Performance Parallel and Distributed
+Computing (New York, NY, USA, 2018), HPDC ’18, Association for Computing Machinery, pp. 92–104.
+[22] Jaiyeoba, W., and Skadron, K. Graphtinker: A high performance data structure for dynamic graph
+processing. In 2019 IEEE International Parallel and Distributed Processing Symposium (IPDPS) (2019),
+pp. 1030–1041.
+[23] Kumar, P., and Huang, H. H. Graphone: A data store for real-time analytics on evolving graphs.
+ACM Trans. Storage 15, 4 (jan 2020).
+[24] Lacki, J. Improved deterministic algorithms for decremental reachability and strongly connected
+components. ACM Trans. Algorithms 9, 3 (jun 2013).
+[25] Leskovec, J., Huttenlocher, D., and Kleinberg, J. Signed networks in social media. CHI ’10,
+Association for Computing Machinery, pp. 1361–1370.
+[26] Leskovec, J., Lang, K. J., Dasgupta, A., and Mahoney, M. W. Community structure in large net-
+works: Natural cluster sizes and the absence of large well-deﬁned clusters, 2008.
+[27] Makkar, D., Bader, D. A., and Green, O. Exact and parallel triangle counting in dynamic graphs.
+In 2017 IEEE 24th International Conference on High Performance Computing (HiPC) (2017), pp. 2–12.
+[28] Malhotra, G., Chappidi, H., and Nasre, R. Fast dynamic graph algorithms. In Languages and
+Compilers for Parallel Computing - 30th International Workshop, LCPC 2017, College Station, TX, USA,
+October 11-13, 2017, Revised Selected Papers (2017), L. Rauchwerger, Ed., vol. 11403 of Lecture Notes in
+Computer Science, Springer, pp. 262–277.
+[29] Nvidia. Nvidia warp primitives, May 2023.
+[30] Pandey, P., Wheatman, B., Xu, H., and Buluc, A.
+Terrace: A hierarchical graph container for
+skewed dynamic graphs. In Proceedings of the 2021 International Conference on Management of Data
+(New York, NY, USA, 2021), SIGMOD ’21, Association for Computing Machinery, p. 1372–1385.
+[31] Ramalingam, G., and Reps, T. On the computational complexity of dynamic graph problems. Theor.
+Comput. Sci. 158, 1-2 (may 1996), 233–277.
+[32] Sha, M., Li, Y., He, B., and Tan, K.-L. Accelerating dynamic graph analytics on gpus. Proc. VLDB
+Endow. 11, 1 (sep 2017), 107–120.
+[33] Soman, J., Kishore, K., and Narayanan, P. J.
+A fast gpu algorithm for graph connectivity. In
+2010 IEEE International Symposium on Parallel & Distributed Processing, Workshops and Phd Forum
+(IPDPSW) (2010), pp. 1–8.
+[34] Sutton, M., Ben-Nun, T., and Barak, A. Optimizing parallel graph connectivity computation via
+subgraph sampling. In 2018 IEEE International Parallel and Distributed Processing Symposium (IPDPS)
+(2018), pp. 12–21.
+31
+
+=== PAGE 32 ===
+[35] Vora, K., Gupta, R., and Xu, G. Kickstarter: Fast and accurate computations on streaming graphs via
+trimmed approximations. In Proceedings of the Twenty-Second International Conference on Architec-
+tural Support for Programming Languages and Operating Systems (New York, NY, USA, 2017), ASPLOS
+’17, Association for Computing Machinery, pp. 237–251.
+[36] Wang, Q., Zheng, L., Huang, Y., Yao, P., Gui, C., Liao, X., Jin, H., Jiang, W., and Mao, F. Grasu: A fast
+graph update library for fpga-based dynamic graph processing. In The 2021 ACM/SIGDA International
+Symposium on Field-Programmable Gate Arrays (New York, NY, USA, 2021), FPGA ’21, Association for
+Computing Machinery, pp. 149–159.
+[37] Winter, M., Mlakar, D., Zayer, R., Seidel, H.-P., and Steinberger, M. Faimgraph: High perfor-
+mance management of fully-dynamic graphs under tight memory constraints on the gpu. In Proceed-
+ings of the International Conference for High Performance Computing, Networking, Storage, and Analysis
+(2018), SC ’18, IEEE Press.
+[38] Winter, M., Zayer, R., and Steinberger, M. Autonomous, independent management of dynamic
+graphs on gpus. In 2017 IEEE High Performance Extreme Computing Conference (HPEC) (2017), pp. 1–7.
+[39] Yang, J., and Leskovec, J. Deﬁning and evaluating network communities based on ground-truth.
+In Proceedings of the ACM SIGKDD Workshop on Mining Data Semantics (New York, NY, USA, 2012),
+MDS ’12, Association for Computing Machinery.
+[40] Zhang, F., Zou, L., and Yu, Y. Lpma - an eﬃcient data structure for dynamic graph on gpus. In
+Web Information Systems Engineering – WISE 2021 (Cham, 2021), W. Zhang, L. Zou, Z. Maamar, and
+L. Chen, Eds., Springer International Publishing, pp. 469–484.
+[41] Zhang, Y., Liang, Y., Zhao, J., Mao, F., Gu, L., Liao, X., Jin, H., Liu, H., Guo, S., Zeng, Y., Hu, H.,
+Li, C., Zhang, J., and Wang, B. Egraph: Eﬃcient concurrent gpu-based dynamic graph processing.
+IEEE Transactions on Knowledge and Data Engineering 35, 6 (2023), 5823–5836.
+[42] Zhu, X., Feng, G., Serafini, M., Ma, X., Yu, J., Xie, L., Aboulnaga, A., and Chen, W. Livegraph: A
+transactional graph storage system with purely sequential adjacency list scans. Proc. VLDB Endow.
+13, 7 (mar 2020), 1020–1034.
+32
+
+=== PAGE 33 ===
+A
+Dynamic Algorithms using Meerkat
+A.1
+Dynamic Triangle Counting
+Algorithm 7: Triangle Counting - Incremental
+1 function TC_Incremental (Graph PostInsertionGraph, Graph UpdateGraph, Edge edges[edge_n]) {
+2
+unsigned int 푆푖
+1 = 0, 푆푖
+2 = 0, 푆푖
+3 = 0
+3
+Count(PostInsertionGraph, PostInsertionGraph, edges, 푆푖
+1)
+4
+Count(PostInsertionGraph, UpdateGraph, edges, 푆푖
+2)
+5
+Count(UpdateGraph, UpdateGraph, edges, 푆푖
+3)
+6
+return 0.5 × (푆푖
+1 - 푆푖
+2 + 푆푖
+3 / 3)
+7 }
+Algorithm 8: Triangle Counting - Decremental
+1 function TC_Decremental (Graph PostDeletionGraph, Graph UpdateGraph, Edge edges[edge_n]) {
+2
+unsigned int 푆푑
+1 = 0, 푆푑
+2 = 0, 푆푑
+3 = 0
+3
+Count(PostDeletionGraph, PostDeletionGraph, edges, 푆푑
+1 )
+4
+Count(PostDeletionGraph, UpdateGraph,edges, 푆푑
+2 )
+5
+Count(UpdateGraph, UpdateGraph, edges, 푆푑
+3 )
+6
+return 0.5 × (푆푑
+1 + 푆푑
+2 + 푆푑
+3 / 3)
+7 }
+Algorithms 7 and 8 show the computation of number of triangles added/deleted after an incremen-
+tal/decremental batch of edges, respectively.
+The 퐶표푢푛푡(퐺1,퐺2,푒푑푔푒푠,푐표푢푛푡) GPU kernel, shown in Algorithm 9 computes the total number of in-
+tersections found in the adjacencies of the end-points of all edges (푢, 푣), for 푢∈푉(퐺1), and 푣∈푉(퐺2).
+A.2
+Dynamic Single Source Shortest Path and Breadth First Search
+Algorithm 6 invokes the SSSP computation kernel (described in Algorithm 6) for static SSSP computation
+(in line 6), and in the common epilogue for incremental and decremental SSSP (line 24). Similarly, Algo-
+rithms 11 and 12 are invoked by the prologue of the decremental SSSP algorithm (at Algorithm 6, lines 18
+and 19, respectively) for invalidation of vertices, and its propogation, in the SSSP value computation de-
+pendence tree.
+A.3
+Dynamic PageRank
+Algorithm 14 (invoked in Algorithm 5, line 9) describes the GPU kernel for computing the PageRank values
+for all vertices of our graph.
+Algorithm 13 (invoked in Algorithm 5, line 11) is used for computing the probability of teleporting
+from vertices with zero out-degree.
+33
+
+=== PAGE 34 ===
+Algorithm 9: Triangle Counting - Count Kernel
+1 function Count(Graph 퐺1, Graph 퐺2, Edge edges[edge_n], int *TotalCount) {
+/* Incremental/decremental batch of edges stored in array edges[]
+*/
+2
+Vertex_Dictionary *vert_adjs[] = G2.get_vertex_adjacencies()
+3
+if ((푡ℎ푟푒푎푑_푖푑() −푙푎푛푒_푖푑() < 푒푑푔푒_푛)) then
+4
+bool to_count = (thread_id() < edge_n)
+5
+unsigned int count = 0
+6
+unsigned int32 work_queue = 0
+7
+Vertex u = INVALID_VERTEX
+8
+Vertex v = INVALID_VERTEX
+9
+if (푡표_푐표푢푛푡== true) then
+/* Assign (u, v) to thread.
+*/
+10
+u = edges.src[thread_id()]
+11
+v = edges.dst[thread_id()]
+12
+end if
+13
+unsigned int32 dequeue_lane = 0
+/* Follows IterationScheme1
+*/
+14
+while ((푑푒푞푢푒푢푒_푙푎푛푒= 푤푎푟푝푑푒푞푢푒푢푒(&푡표_푐표푚푝푢푡푒)) ≠−1) do
+15
+Vertex current_u = warpbroadcast(&u, current_lane)
+16
+Vertex current_v = warpbroadcast(&v, current_lane)
+/* Construct iterators for traversal of adjacent slabs for vertex 푣in 퐺2
+*/
+17
+SlabIterator iter = vert_adjs[current_v].begin()
+18
+SlabIterator last = vert_adjs[current_v].end()
+19
+while (푖푡푒푟≠푙푎푠푡) do
+/* Loop performs intersection of the adjacencies of 푢in 퐺1 and 푣in 퐺2
+*/
+20
+Vertex adj_v = *(iter.get_pointer(lane_id()))
+21
+bool edge_present = 퐺1.SearchEdge(is_valid_vertex(adj_v), current_u, adj_v)
+22
+if (푒푑푔푒_푝푟푒푠푒푛푡) then
+/* Update thread-local count if intersection found
+*/
+23
+count += 1
+24
+end if
+25
+++ iter
+26
+end while
+27
+end while
+/* Warp-level reduction of intersection count
+*/
+28
+warpreduxsum(&count)
+29
+if (푙푎푛푒_푖푑() == 0 and 푐표푢푛푡≠0) then
+/* Update global intersection count. Each warp performs atmost one atomicAdd()
+*/
+30
+atomicAdd(TotalCount, count)
+31
+end if
+32
+end if
+33 }
+34
+
+=== PAGE 35 ===
+Algorithm 10: Static SSSP - Computation Kernel
+1 function SSSP_Kernel(Graph 퐺, tree_node 퐷[푣푒푟푡푒푥_푛], Frontier<Edge> 퐹푐푢푟푟푒푛푡, Frontier<Edge> 퐹푛푒푥푡
+) {
+2
+Vertex_Dictionary *vert_adjs[] = G.get_vertex_adjacencies()
+3
+if ((푡ℎ푟푒푎푑_푖푑() −푙푎푛푒_푖푑()) < 퐹푐푢푟푟푒푛푡.푠푖푧푒) then
+4
+Edge e = INVALID_EDGE
+5
+bool to_consider = false
+6
+if (푡ℎ푟푒푎푑_푖푑() < 퐹푐푢푟푟푒푛푡.푠푖푧푒) then
+7
+e = 퐹푐푢푟푟푒푛푡[thread_id()]
+/* Compute tree node for vertex 푒.푑푠푡
+*/
+8
+tree_node 푑푑푠푡= <D[e.src].distance + e.wgt, e.src>
+/* Atomically update tree node for 푒.푑푠푡
+*/
+9
+to_consider = atomicMin(&D[e.dst], 푑푑푠푡) > 푑푑푠푡
+10
+end if
+11
+unsigned int32 dequeue_lane = 0
+/* Loop enqueues outgoing neighbours of 푒.푑푠푡, if its tree node was updated
+*/
+12
+while ((푑푒푞푢푒푢푒_푙푎푛푒= warpdequeue(&푡표_푐표푛푠푖푑푒푟)) ≠−1) do
+13
+Vertex current_v = warpbroadcast(e.dst, 푑푒푞푢푒푢푒_푙푎푛푒)
+14
+SlabIterator iter = vert_adjs[푐푢푟푟푒푛푡_푣].begin()
+15
+SlabIterator last = vert_adjs[푐푢푟푟푒푛푡_푣].end()
+16
+while (푖푡푒푟≠푙푎푠푡) do
+/* Iterate over neighbours
+*/
+17
+Pair p<푑푠푡,푤푒푖푔ℎ푡> = *(iter.get_pointer(lane_id()))
+18
+Edge 푒푛푒푥푡= INVALID_EDGE
+19
+if (푖푠_푣푎푙푖푑_푝푎푖푟(푝)) then
+20
+푒푛푒푥푡= {푐푢푟푟푒푛푡_푣, 푝.푑푠푡, 푝.푤푒푖푔ℎ푡}
+21
+end if
+/* Enqueue outgoing edges of 푒.푑푠푡into next frontier 퐹푛푒푥푡
+*/
+22
+warpenqeuefrontier(퐹푛푒푥푡,푒푛푒푥푡,푒푛푒푥푡≠INVALID_EDGE)
+23
+++ iter
+24
+end while
+25
+end while
+26
+end if
+27 }
+Algorithm 11: Decremental SSSP - Invalidate Distance Kernel
+1 function Invalidate (Edges 푏푎푡푐ℎ_푒푑푔푒푠[푁], tree_node 퐷[푣푒푟푡푒푥_푛]) {
+2
+uint t = thread_id()
+3
+if (푡< 푁) then
+4
+Vertex dst = batch_edges[푡].dst
+/* Invalidate tree node for vertex 푑푠푡if (푝푎푟푒푛푡푑푠푡,푑푠푡) is a batch edge for
+deletion
+*/
+5
+if (퐷[푑푠푡].푝푎푟푒푛푡== 푏푎푡푐ℎ_푒푑푔푒푠[푡].푠푟푐) then
+6
+D[푑푠푡] = ⟨INF, INVALID⟩
+7
+end if
+8
+end if
+9 }
+35
+
+=== PAGE 36 ===
+Algorithm 12: Decremental SSSP - Propogate Invalidation Kernel
+1 function PropogateInvalidation (tree_node 퐷[푣푒푟푡푒푥_푛], Vertex 푠푟푐) {
+2
+uint i = threads_id()
+/* Grid-stride loop: each thread checks if the vertex 푖is reachable to source 푠푟푐in
+the dependence tree
+*/
+3
+while (푖< 푣푒푟푡푒푥_푛) do
+4
+if (퐷[푖] ≠⟨INF, INVALID⟩) then
+5
+Vertex ancestor = 퐷[푖].parent
+6
+while (푎푛푐푒푠푡표푟! = 푠푟푐) do
+/* Traverses to the source vertex 푠푟푐: loops until 푠푟푐or invalidated vertex
+is found in path
+*/
+7
+tree_node 푑푎= D[푎푛푐푒푠푡표푟]
+8
+if (푑푎== ⟨INF, INVALID⟩) then
+/* Invalidate vertex 푖if ancestor 푎is invalidated
+*/
+9
+퐷[푖] = ⟨INF, INVALID⟩
+10
+break
+11
+end if
+12
+푎푛푐푒푠푡표푟= D[푑푎].parent
+13
+end while
+14
+end if
+15
+i += threads_n()
+16
+end while
+17 }
+Algorithm 13: PageRank Algorithm - Find Teleport Value Kernel
+1 function FindTeleportProb (uint OutDegrees[vertex_n], float OldPageRanks[vertex_n], float *TeleportProb)
+{
+2
+uint stride = get_num_threads()
+3
+uint I = thread_id()
+4
+float local = 0.0
+/* Uses grid-stride loop for accumulating contribution to teleportation probability */
+5
+while (퐼< 푣푒푟푡푒푥_푛) do
+6
+uint out_degree = OutDegrees[I]
+7
+if (표푢푡_푑푒푔푟푒푒== 0) then
+8
+local += OldPageRanks[I] / vertex_n
+9
+end if
+10
+end while
+/* Warp-wide reduction of contributions to teleportation probability
+*/
+11
+warpreduxsum(&local)
+12
+if (푙푎푛푒_푖푑() == 0 and 푙표푐푎푙≠0.0푓) then
+/* Update global TeleportProb. Each warp performs atmost one atomicAdd()
+*/
+13
+atomicAdd(TeleportProb, local)
+14
+end if
+15 }
+36
+
+=== PAGE 37 ===
+Algorithm 14: Page Rank - Compute Kernel
+1 function Compute (Graph 퐺, float VertexContribution[vertex_n], float DampingFactor, float
+NewPageRanks[vertex_n]) {
+2
+Vertex_Dictionary *vert_adjs[] = G.get_vertex_adjacencies()
+3
+if ((푡ℎ푟푒푎푑_푖푑() −푙푎푛푒_푖푑() < 푒푑푔푒_푛)) then
+4
+bool to_compute = (thread_id() < VertexN)
+5
+unsigned int pr_value = 0
+/* Follows IterationScheme1
+*/
+6
+unsigned int32 dequeue_lane = 0
+7
+while ((푑푒푞푢푒푢푒_푙푎푛푒= 푤푎푟푝푑푒푞푢푒푢푒(&푡표_푐표푚푝푢푡푒)) ≠−1) do
+8
+Vertex current_v = thread_id() - lane_id()+ dequeue_lane
+/* Construct iterators for traversal
+*/
+9
+SlabIterator iter = vert_adjs[current_v].begin()
+10
+SlabIterator last = vert_adjs[current_v].end()
+11
+float local_prsum = 0.0f
+12
+while (푖푡푒푟≠푙푎푠푡) do
+/* Traversal of slabs using SlabIterators
+*/
+13
+Vertex u = *(iter.get_pointer(lane_id()))
+14
+if (푖푠_푣푎푙푖푑_푣푒푟푡푒푥(푢)) then
+/* Accumulation of thread-local vertex contributions to
+PageRank[current_v]
+*/
+15
+local_prsum += VertexContribution[u]
+16
+end if
+17
+++ iter
+18
+end while
+/* Warp-wide reduction of thread-local vertex contributions
+*/
+19
+warpreduxsum(&local_prsum)
+20
+if (푡ℎ푟푒푎푑_푖푑() == 푐푢푟푟푒푛푡_푣) then
+/* Update thread-local PageRank value after warp-wide reduction
+*/
+21
+pr_value = local_prsum
+22
+end if
+23
+end while
+/* Update PageRanks in coalesced fashion
+*/
+24
+if (푡ℎ푟푒푎푑_푖푑() < 푣푒푟푡푒푥_푛) then
+25
+NewPageRanks[thread_id()] = pr_value
+26
+end if
+27
+end if
+28 }
+37

@@ -1,0 +1,68 @@
+﻿== A. randomized adversarial histories (expect PASS) ==
+mixed-uniform-V256         coop=0 dst=0 ser=0 cscan=0 mut=0 | commits=20000 aborts=26849 giveup=0 eff=37644 noop=18210 casfail=1139 grow=344 void=52699 | DSGcyc=319564 | checker=PASS [as expected] 
+mixed-uniform-V256         coop=0 dst=1 ser=0 cscan=1 mut=0 | commits=20000 aborts=23120 giveup=0 eff=37627 noop=18227 casfail=2033 grow=418 void=48568 | DSGcyc=316530 | checker=PASS [as expected] 
+mixed-uniform-V256         coop=1 dst=0 ser=0 cscan=1 mut=0 | commits=20000 aborts=26107 giveup=0 eff=37389 noop=18465 casfail=1593 grow=342 void=51951 | DSGcyc=306553 | checker=PASS [as expected] 
+mixed-uniform-V256         coop=1 dst=1 ser=0 cscan=0 mut=0 | commits=20000 aborts=23877 giveup=0 eff=37897 noop=17957 casfail=1538 grow=418 void=49120 | DSGcyc=334774 | checker=PASS [as expected] 
+mixed-uniform-V256         coop=0 dst=0 ser=1 cscan=1 mut=0 | commits=20000 aborts=128565 giveup=0 eff=36956 noop=18898 casfail=1926 grow=598 void=120512 | DSGcyc=0 | checker=PASS [as expected] 
+mixed-uniform-V256         coop=0 dst=1 ser=1 cscan=0 mut=0 | commits=20000 aborts=127959 giveup=0 eff=37068 noop=18786 casfail=1509 grow=674 void=116272 | DSGcyc=0 | checker=PASS [as expected] 
+mixed-uniform-V256         coop=1 dst=0 ser=1 cscan=0 mut=0 | commits=20000 aborts=134794 giveup=0 eff=36897 noop=18957 casfail=1117 grow=599 void=122646 | DSGcyc=0 | checker=PASS [as expected] 
+mixed-uniform-V256         coop=1 dst=1 ser=1 cscan=1 mut=0 | commits=20000 aborts=123799 giveup=0 eff=37120 noop=18734 casfail=2390 grow=674 void=115359 | DSGcyc=0 | checker=PASS [as expected] 
+hub50-mixed                coop=0 dst=0 ser=0 cscan=0 mut=0 | commits=13924 aborts=219233 giveup=6076 eff=27760 noop=16112 casfail=551 grow=1881 void=294693 | DSGcyc=2173462 | checker=PASS [as expected] 
+hub50-mixed                coop=0 dst=1 ser=0 cscan=1 mut=0 | commits=20000 aborts=89434 giveup=0 eff=39658 noop=24355 casfail=540 grow=1903 void=141822 | DSGcyc=4208961 | checker=PASS [as expected] 
+hub50-mixed                coop=1 dst=0 ser=0 cscan=1 mut=0 | commits=20000 aborts=90146 giveup=0 eff=39502 noop=24511 casfail=544 grow=1899 void=142839 | DSGcyc=4262191 | checker=PASS [as expected] 
+hub50-mixed                coop=1 dst=1 ser=0 cscan=0 mut=0 | commits=14083 aborts=208451 giveup=5917 eff=28234 noop=16182 casfail=836 grow=1849 void=294789 | DSGcyc=2107739 | checker=PASS [as expected] 
+hub50-mixed                coop=0 dst=0 ser=1 cscan=1 mut=0 | commits=17822 aborts=252293 giveup=2178 eff=34297 noop=23792 casfail=453 grow=2275 void=290094 | DSGcyc=0 | checker=PASS [as expected] 
+hub50-mixed                coop=0 dst=1 ser=1 cscan=0 mut=0 | commits=17080 aborts=207184 giveup=2920 eff=33269 noop=23173 casfail=305 grow=2271 void=241550 | DSGcyc=0 | checker=PASS [as expected] 
+hub50-mixed                coop=1 dst=0 ser=1 cscan=0 mut=0 | commits=17083 aborts=197847 giveup=2917 eff=33332 noop=23111 casfail=237 grow=2266 void=230389 | DSGcyc=0 | checker=PASS [as expected] 
+hub50-mixed                coop=1 dst=1 ser=1 cscan=1 mut=0 | commits=17802 aborts=252806 giveup=2198 eff=34308 noop=23746 casfail=518 grow=2274 void=288230 | DSGcyc=0 | checker=PASS [as expected] 
+identical-edge-8           coop=0 dst=0 ser=0 cscan=0 mut=0 | commits=11268 aborts=314152 giveup=8732 eff=6298 noop=16238 casfail=43521 grow=1306 void=368120 | DSGcyc=53 | checker=PASS [as expected] 
+identical-edge-8           coop=0 dst=1 ser=0 cscan=1 mut=0 | commits=11247 aborts=319556 giveup=8753 eff=6362 noop=16132 casfail=44230 grow=1305 void=374318 | DSGcyc=35 | checker=PASS [as expected] 
+identical-edge-8           coop=1 dst=0 ser=0 cscan=1 mut=0 | commits=11305 aborts=316583 giveup=8695 eff=6235 noop=16375 casfail=43390 grow=1307 void=371225 | DSGcyc=32 | checker=PASS [as expected] 
+identical-edge-8           coop=1 dst=1 ser=0 cscan=0 mut=0 | commits=11335 aborts=319678 giveup=8665 eff=6268 noop=16402 casfail=42331 grow=1293 void=373542 | DSGcyc=50 | checker=PASS [as expected] 
+identical-edge-8           coop=0 dst=0 ser=1 cscan=1 mut=0 | commits=7855 aborts=330761 giveup=12145 eff=4120 noop=11590 casfail=37752 grow=1407 void=371201 | DSGcyc=0 | checker=PASS [as expected] 
+identical-edge-8           coop=0 dst=1 ser=1 cscan=0 mut=0 | commits=8988 aborts=376945 giveup=11012 eff=4942 noop=13034 casfail=43719 grow=1390 void=424346 | DSGcyc=0 | checker=PASS [as expected] 
+identical-edge-8           coop=1 dst=0 ser=1 cscan=0 mut=0 | commits=9164 aborts=373061 giveup=10836 eff=4804 noop=13524 casfail=43743 grow=1390 void=420925 | DSGcyc=0 | checker=PASS [as expected] 
+identical-edge-8           coop=1 dst=1 ser=1 cscan=1 mut=0 | commits=8995 aborts=381230 giveup=11005 eff=4886 noop=13104 casfail=42693 grow=1386 void=429846 | DSGcyc=0 | checker=PASS [as expected] 
+churn-V64-K8               coop=0 dst=0 ser=0 cscan=0 mut=0 | commits=10000 aborts=83938 giveup=0 eff=36291 noop=35659 casfail=1638 grow=189 void=190016 | DSGcyc=331540 | checker=PASS [as expected] 
+churn-V64-K8               coop=0 dst=1 ser=0 cscan=1 mut=0 | commits=10000 aborts=71900 giveup=0 eff=36155 noop=35795 casfail=4693 grow=173 void=170500 | DSGcyc=310875 | checker=PASS [as expected] 
+churn-V64-K8               coop=1 dst=0 ser=0 cscan=1 mut=0 | commits=10000 aborts=72773 giveup=0 eff=35984 noop=35966 casfail=4267 grow=158 void=172143 | DSGcyc=307476 | checker=PASS [as expected] 
+churn-V64-K8               coop=1 dst=1 ser=0 cscan=0 mut=0 | commits=10000 aborts=79999 giveup=0 eff=36546 noop=35404 casfail=2068 grow=192 void=182652 | DSGcyc=326404 | checker=PASS [as expected] 
+churn-V64-K8               coop=0 dst=0 ser=1 cscan=1 mut=0 | commits=3613 aborts=112449 giveup=6387 eff=13996 noop=13004 casfail=5477 grow=193 void=222999 | DSGcyc=0 | checker=PASS [as expected] 
+churn-V64-K8               coop=0 dst=1 ser=1 cscan=0 mut=0 | commits=3782 aborts=157859 giveup=6218 eff=14355 noop=14053 casfail=2225 grow=208 void=321665 | DSGcyc=0 | checker=PASS [as expected] 
+churn-V64-K8               coop=1 dst=0 ser=1 cscan=0 mut=0 | commits=3765 aborts=128190 giveup=6235 eff=14259 noop=13958 casfail=1737 grow=193 void=239972 | DSGcyc=0 | checker=PASS [as expected] 
+churn-V64-K8               coop=1 dst=1 ser=1 cscan=1 mut=0 | commits=3811 aborts=106211 giveup=6189 eff=14663 noop=13877 casfail=5531 grow=208 void=212220 | DSGcyc=0 | checker=PASS [as expected] 
+zipf-readers50             coop=0 dst=0 ser=0 cscan=0 mut=0 | commits=20000 aborts=25426 giveup=0 eff=24894 noop=7154 casfail=40 grow=1502 void=38869 | DSGcyc=1240995 | checker=PASS [as expected] 
+zipf-readers50             coop=0 dst=1 ser=0 cscan=1 mut=0 | commits=20000 aborts=11340 giveup=0 eff=24960 noop=7088 casfail=185 grow=1374 void=21140 | DSGcyc=1180305 | checker=PASS [as expected] 
+zipf-readers50             coop=1 dst=0 ser=0 cscan=1 mut=0 | commits=20000 aborts=14621 giveup=0 eff=24853 noop=7195 casfail=174 grow=1442 void=25033 | DSGcyc=1235756 | checker=PASS [as expected] 
+zipf-readers50             coop=1 dst=1 ser=0 cscan=0 mut=0 | commits=20000 aborts=29323 giveup=0 eff=25007 noop=7041 casfail=48 grow=1469 void=43686 | DSGcyc=1176445 | checker=PASS [as expected] 
+zipf-readers50             coop=0 dst=0 ser=1 cscan=1 mut=0 | commits=18501 aborts=413522 giveup=1499 eff=21760 noop=6407 casfail=1168 grow=2410 void=259819 | DSGcyc=0 | checker=PASS [as expected] 
+zipf-readers50             coop=0 dst=1 ser=1 cscan=0 mut=0 | commits=18495 aborts=323713 giveup=1505 eff=21884 noop=6285 casfail=169 grow=2423 void=214555 | DSGcyc=0 | checker=PASS [as expected] 
+zipf-readers50             coop=1 dst=0 ser=1 cscan=0 mut=0 | commits=18467 aborts=315031 giveup=1533 eff=21660 noop=6440 casfail=258 grow=2362 void=208139 | DSGcyc=0 | checker=PASS [as expected] 
+zipf-readers50             coop=1 dst=1 ser=1 cscan=1 mut=0 | commits=18526 aborts=395434 giveup=1474 eff=21954 noop=6275 casfail=1195 grow=2455 void=256819 | DSGcyc=0 | checker=PASS [as expected] 
+hub30-K32                  coop=0 dst=0 ser=0 cscan=0 mut=0 | commits=25447 aborts=253626 giveup=4553 eff=518197 noop=213002 casfail=11367 grow=12660 void=1068713 | DSGcyc=21 | checker=PASS [as expected] 
+hub30-K32                  coop=0 dst=1 ser=0 cscan=1 mut=0 | commits=25389 aborts=247864 giveup=4611 eff=517302 noop=212384 casfail=12242 grow=12660 void=1062699 | DSGcyc=30 | checker=PASS [as expected] 
+hub30-K32                  coop=1 dst=0 ser=0 cscan=1 mut=0 | commits=25313 aborts=254207 giveup=4687 eff=515706 noop=211624 casfail=10916 grow=12660 void=1070840 | DSGcyc=32 | checker=PASS [as expected] 
+hub30-K32                  coop=1 dst=1 ser=0 cscan=0 mut=0 | commits=25383 aborts=248350 giveup=4617 eff=516548 noop=212730 casfail=11762 grow=12660 void=1064992 | DSGcyc=33 | checker=PASS [as expected] 
+hub30-K32                  coop=0 dst=0 ser=1 cscan=1 mut=0 | commits=13780 aborts=284354 giveup=16220 eff=282643 noop=113680 casfail=13309 grow=12660 void=1121041 | DSGcyc=0 | checker=PASS [as expected] 
+hub30-K32                  coop=0 dst=1 ser=1 cscan=0 mut=0 | commits=13758 aborts=277706 giveup=16242 eff=282735 noop=112986 casfail=14329 grow=12660 void=1113180 | DSGcyc=0 | checker=PASS [as expected] 
+hub30-K32                  coop=1 dst=0 ser=1 cscan=0 mut=0 | commits=13654 aborts=284408 giveup=16346 eff=280090 noop=112542 casfail=13277 grow=12660 void=1121673 | DSGcyc=0 | checker=PASS [as expected] 
+hub30-K32                  coop=1 dst=1 ser=1 cscan=1 mut=0 | commits=13736 aborts=277799 giveup=16264 eff=282178 noop=113067 casfail=14215 grow=12660 void=1114496 | DSGcyc=0 | checker=PASS [as expected] 
+== B. write-skew probe ==
+write-skew SI              coop=1 dst=1 ser=0 cscan=1 mut=0 | commits=32000 aborts=0 giveup=0 eff=32000 noop=0 casfail=2633 grow=4000 void=0 | DSGcyc=16000 | checker=PASS [as expected] 
+   SI anomaly witnessed: YES (DSG back edges=16000)
+write-skew SER             coop=1 dst=1 ser=1 cscan=1 mut=0 | commits=32000 aborts=61607 giveup=0 eff=32000 noop=0 casfail=3827 grow=8000 void=12 | DSGcyc=0 | checker=PASS [as expected] 
+== C. mutation tests (expect FAIL: checker must catch the broken protocol) ==
+mut1-no-ww-check           coop=1 dst=1 ser=0 cscan=1 mut=1 | commits=20000 aborts=0 giveup=0 eff=20037 noop=19963 casfail=2545851 grow=1020 void=22256 | DSGcyc=6330 | checker=FAIL [as expected] C3 two writers of one key share a commit timestamp
+   mut1 violations: C1-read=466 C1-scan=0 C2-obs=5005 C3-ww=4337 C3-sameEpoch=11056 C4-finalMissing=0 C4-finalExtra=11478 C5-backEdges=6330 | prototype log-vs-final: missing=0 extra=0
+mut2-dirty-reads           coop=1 dst=1 ser=0 cscan=1 mut=2 | commits=20000 aborts=8004 giveup=0 eff=38365 noop=17489 casfail=1980 grow=418 void=28586 | DSGcyc=273437 | checker=FAIL [as expected] C1 scan txn 46 vertex 227: got 35/d502c949 expected 10/863933be
+   mut2 violations: C1-read=11520 C1-scan=6972 C2-obs=15119 C3-ww=749 C3-sameEpoch=10 C4-finalMissing=2183 C4-finalExtra=314 C5-backEdges=273437 | prototype log-vs-final: missing=1133 extra=334
+mut3-ignore-snapshot       coop=1 dst=1 ser=0 cscan=1 mut=3 | commits=20000 aborts=15610 giveup=0 eff=37705 noop=18149 casfail=1987 grow=418 void=38758 | DSGcyc=300925 | checker=FAIL [as expected] C1 scan txn 46 vertex 64: got 40/9d974ccf expected 13/e70585f0
+   mut3 violations: C1-read=9725 C1-scan=5361 C2-obs=10906 C3-ww=163 C3-sameEpoch=0 C4-finalMissing=1973 C4-finalExtra=206 C5-backEdges=300925 | prototype log-vs-final: missing=0 extra=0
+== D. resource exhaustion (tiny arena; expect PASS on committed prefix) ==
+tiny-arena                 coop=1 dst=1 ser=0 cscan=1 mut=0 | commits=1 aborts=21898 giveup=19999 eff=3 noop=1 casfail=3898 grow=515 void=5543 | DSGcyc=0 | checker=PASS [as expected] 
+   resource aborts=19999 giveups=19999 commits=1 flag=1
+   arena=20000 commits=0 resource=20000 flag=1 grow=515 checker=PASS
+   arena=40000 commits=80 resource=19920 flag=1 grow=553 checker=PASS
+   arena=200000 commits=15340 resource=4660 flag=1 grow=780 checker=PASS
+
+RESULT: ALL AS EXPECTED (0 unexpected)

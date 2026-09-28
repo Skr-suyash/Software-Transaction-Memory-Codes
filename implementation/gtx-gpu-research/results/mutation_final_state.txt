@@ -1,0 +1,20 @@
+﻿== A. randomized adversarial histories (expect PASS) ==
+== B. write-skew probe ==
+write-skew SI              coop=1 dst=1 ser=0 cscan=1 mut=0 | commits=32000 aborts=0 giveup=0 eff=32000 noop=0 casfail=2705 grow=4000 void=0 | DSGcyc=16000 | checker=PASS [as expected] 
+   SI anomaly witnessed: YES (DSG back edges=16000)
+write-skew SER             coop=1 dst=1 ser=1 cscan=1 mut=0 | commits=32000 aborts=61596 giveup=0 eff=32000 noop=0 casfail=3733 grow=8000 void=9 | DSGcyc=0 | checker=PASS [as expected] 
+== C. mutation tests (expect FAIL: checker must catch the broken protocol) ==
+mut1-no-ww-check           coop=1 dst=1 ser=0 cscan=1 mut=1 | commits=20000 aborts=0 giveup=0 eff=20036 noop=19964 casfail=2429328 grow=1020 void=22305 | DSGcyc=6557 | checker=FAIL [as expected] C3 two writers of one key share a commit timestamp
+   mut1 violations: C1-read=511 C1-scan=0 C2-obs=4980 C3-ww=4386 C3-sameEpoch=10984 C4-finalMissing=0 C4-finalExtra=11507 C5-backEdges=6557 | prototype log-vs-final: missing=0 extra=0
+mut2-dirty-reads           coop=1 dst=1 ser=0 cscan=1 mut=2 | commits=20000 aborts=7999 giveup=0 eff=38293 noop=17561 casfail=2007 grow=418 void=28610 | DSGcyc=271175 | checker=FAIL [as expected] C1 scan txn 5 vertex 239: got 19/51ebf177 expected 6/c37661b4
+   mut2 violations: C1-read=11411 C1-scan=6972 C2-obs=15097 C3-ww=751 C3-sameEpoch=14 C4-finalMissing=2139 C4-finalExtra=343 C5-backEdges=271175 | prototype log-vs-final: missing=1133 extra=340
+mut3-ignore-snapshot       coop=1 dst=1 ser=0 cscan=1 mut=3 | commits=20000 aborts=15465 giveup=0 eff=37610 noop=18244 casfail=1933 grow=418 void=38683 | DSGcyc=301431 | checker=FAIL [as expected] C1 scan txn 46 vertex 64: got 45/950b6413 expected 13/e70585f0
+   mut3 violations: C1-read=9658 C1-scan=5382 C2-obs=10859 C3-ww=204 C3-sameEpoch=0 C4-finalMissing=1980 C4-finalExtra=194 C5-backEdges=301431 | prototype log-vs-final: missing=0 extra=0
+== D. resource exhaustion (tiny arena; expect PASS on committed prefix) ==
+tiny-arena                 coop=1 dst=1 ser=0 cscan=1 mut=0 | commits=0 aborts=21905 giveup=20000 eff=0 noop=0 casfail=3818 grow=515 void=5461 | DSGcyc=0 | checker=PASS [as expected] 
+   resource aborts=20000 giveups=20000 commits=0 flag=1
+   arena=20000 commits=0 resource=20000 flag=1 grow=515 checker=PASS
+   arena=40000 commits=69 resource=19931 flag=1 grow=554 checker=PASS
+   arena=200000 commits=15316 resource=4684 flag=1 grow=780 checker=PASS
+
+RESULT: ALL AS EXPECTED (0 unexpected)

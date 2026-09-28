@@ -1,0 +1,291 @@
+%%% -*-BibTeX-*-
+%%% Do NOT edit. File created by BibTeX with style
+%%% ACM-Reference-Format-Journals [18-Jan-2012].
+
+\begin{thebibliography}{21}
+
+%%% ====================================================================
+%%% NOTE TO THE USER: you can override these defaults by providing
+%%% customized versions of any of these macros before the \bibliography
+%%% command.  Each of them MUST provide its own final punctuation,
+%%% except for \shownote{} and \showURL{}.  The latter does
+%%% not use final punctuation, in order to avoid confusing it with
+%%% the Web address.
+%%%
+%%% To suppress output of a particular field, define its macro to expand
+%%% to an empty string, or better, \unskip, like this:
+%%%
+%%% \newcommand{\showURL}[1]{\unskip}   % LaTeX syntax
+%%%
+%%% \def \showURL #1{\unskip}           % plain TeX syntax
+%%%
+%%% ====================================================================
+
+\ifx \showCODEN    \undefined \def \showCODEN     #1{\unskip}     \fi
+\ifx \showISBNx    \undefined \def \showISBNx     #1{\unskip}     \fi
+\ifx \showISBNxiii \undefined \def \showISBNxiii  #1{\unskip}     \fi
+\ifx \showISSN     \undefined \def \showISSN      #1{\unskip}     \fi
+\ifx \showLCCN     \undefined \def \showLCCN      #1{\unskip}     \fi
+\ifx \shownote     \undefined \def \shownote      #1{#1}          \fi
+\ifx \showarticletitle \undefined \def \showarticletitle #1{#1}   \fi
+\ifx \showURL      \undefined \def \showURL       {\relax}        \fi
+% The following commands are used for tagged output and should be
+% invisible to TeX
+\providecommand\bibfield[2]{#2}
+\providecommand\bibinfo[2]{#2}
+\providecommand\natexlab[1]{#1}
+\providecommand\showeprint[2][]{arXiv:#2}
+\makeatletter
+\@ifundefined{NAT@parse@date}{}{\let\NAT@parse@date@orig\NAT@parse@date}
+\@ifundefined{NAT@parse@date}{}{\def\NAT@parse@date#1#2#3#4#5#6@@{\NAT@parse@date@orig#1#2#3#4#5#6@@\def\NAT@tempyear{0000}\def\NAT@tempexlab{{?}}\ifx\NAT@year\NAT@tempyear\ifx\NAT@exlab\NAT@tempexlab\def\NAT@date{[n.\,d.]}\else\edef\NAT@date{[n.\,d.]\NAT@exlab}\fi\fi}}
+\makeatother
+
+\bibitem[Adya(1999)]%
+        {adya}
+\bibfield{author}{\bibinfo{person}{Atul Adya}.}
+  \bibinfo{year}{1999}\natexlab{}.
+\newblock \emph{\bibinfo{title}{Weak Consistency: A Generalized Theory and
+  Optimistic Implementations for Distributed Transactions}}.
+\newblock \bibinfo{thesistype}{Ph.\,D. Dissertation}.
+  \bibinfo{school}{Massachusetts Institute of Technology}.
+\newblock
+
+
+\bibitem[Ashkiani et~al\mbox{.}(2018)]%
+        {slabhash}
+\bibfield{author}{\bibinfo{person}{Saman Ashkiani}, \bibinfo{person}{Martin
+  Farach-Colton}, {and} \bibinfo{person}{John~D. Owens}.}
+  \bibinfo{year}{2018}\natexlab{}.
+\newblock \showarticletitle{A Dynamic Hash Table for the {GPU}}. In
+  \bibinfo{booktitle}{\emph{IEEE International Parallel and Distributed
+  Processing Symposium (IPDPS)}}.
+\newblock
+
+
+\bibitem[Awad et~al\mbox{.}(2020)]%
+        {slabgraph}
+\bibfield{author}{\bibinfo{person}{Muhammad~A. Awad}, \bibinfo{person}{Saman
+  Ashkiani}, \bibinfo{person}{Serban~D. Porumbescu}, {and}
+  \bibinfo{person}{John~D. Owens}.} \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{Dynamic Graphs on the {GPU}}. In
+  \bibinfo{booktitle}{\emph{IEEE International Parallel and Distributed
+  Processing Symposium (IPDPS)}}.
+\newblock
+
+
+\bibitem[Berenson et~al\mbox{.}(1995)]%
+        {berenson}
+\bibfield{author}{\bibinfo{person}{Hal Berenson}, \bibinfo{person}{Phil
+  Bernstein}, \bibinfo{person}{Jim Gray}, \bibinfo{person}{Jim Melton},
+  \bibinfo{person}{Elizabeth O'Neil}, {and} \bibinfo{person}{Patrick O'Neil}.}
+  \bibinfo{year}{1995}\natexlab{}.
+\newblock \showarticletitle{A Critique of {ANSI} {SQL} Isolation Levels}. In
+  \bibinfo{booktitle}{\emph{ACM SIGMOD International Conference on Management
+  of Data}}.
+\newblock
+
+
+\bibitem[Busato et~al\mbox{.}(2018)]%
+        {hornet}
+\bibfield{author}{\bibinfo{person}{Federico Busato}, \bibinfo{person}{Oded
+  Green}, \bibinfo{person}{Nicola Bombieri}, {and} \bibinfo{person}{David~A.
+  Bader}.} \bibinfo{year}{2018}\natexlab{}.
+\newblock \showarticletitle{Hornet: An Efficient Data Structure for Dynamic
+  Sparse Graphs and Matrices on {GPUs}}. In \bibinfo{booktitle}{\emph{IEEE High
+  Performance Extreme Computing Conference (HPEC)}}.
+\newblock
+
+
+\bibitem[Cahill et~al\mbox{.}(2008)]%
+        {cahill}
+\bibfield{author}{\bibinfo{person}{Michael~J. Cahill}, \bibinfo{person}{Uwe
+  R{\"o}hm}, {and} \bibinfo{person}{Alan~D. Fekete}.}
+  \bibinfo{year}{2008}\natexlab{}.
+\newblock \showarticletitle{Serializable Isolation for Snapshot Databases}. In
+  \bibinfo{booktitle}{\emph{ACM SIGMOD International Conference on Management
+  of Data}}.
+\newblock
+
+
+\bibitem[Concessao et~al\mbox{.}(2023)]%
+        {meerkat}
+\bibfield{author}{\bibinfo{person}{Kevin~Jude Concessao},
+  \bibinfo{person}{Unnikrishnan Cheramangalath}, \bibinfo{person}{M.~J.~Ricky
+  Dev}, {and} \bibinfo{person}{Rupesh Nasre}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Meerkat: A Framework for Dynamic Graph Algorithms
+  on {GPUs}}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2305.17813}}
+  (\bibinfo{year}{2023}).
+\newblock
+
+
+\bibitem[Dice et~al\mbox{.}(2006)]%
+        {tl2}
+\bibfield{author}{\bibinfo{person}{Dave Dice}, \bibinfo{person}{Ori Shalev},
+  {and} \bibinfo{person}{Nir Shavit}.} \bibinfo{year}{2006}\natexlab{}.
+\newblock \showarticletitle{Transactional Locking {II}}. In
+  \bibinfo{booktitle}{\emph{International Symposium on Distributed Computing
+  (DISC)}}.
+\newblock
+
+
+\bibitem[Fuchs et~al\mbox{.}(2022)]%
+        {sortledton}
+\bibfield{author}{\bibinfo{person}{Per Fuchs}, \bibinfo{person}{Domagoj
+  Margan}, {and} \bibinfo{person}{Jana Giceva}.}
+  \bibinfo{year}{2022}\natexlab{}.
+\newblock \showarticletitle{Sortledton: A Universal, Transactional Graph Data
+  Structure}.
+\newblock \bibinfo{journal}{\emph{Proceedings of the VLDB Endowment}}
+  \bibinfo{volume}{15}, \bibinfo{number}{6} (\bibinfo{year}{2022}).
+\newblock
+
+
+\bibitem[Leo and Boncz(2021)]%
+        {teseo}
+\bibfield{author}{\bibinfo{person}{Dean~De Leo} {and} \bibinfo{person}{Peter
+  Boncz}.} \bibinfo{year}{2021}\natexlab{}.
+\newblock \showarticletitle{Teseo and the Analysis of Structural Dynamic
+  Graphs}.
+\newblock \bibinfo{journal}{\emph{Proceedings of the VLDB Endowment}}
+  \bibinfo{volume}{14}, \bibinfo{number}{6} (\bibinfo{year}{2021}).
+\newblock
+
+
+\bibitem[Lin et~al\mbox{.}(2025)]%
+        {survey25}
+\bibfield{author}{\bibinfo{person}{Yinnian Lin}, \bibinfo{person}{Lei Zou},
+  {and} \bibinfo{person}{Xunbin Su}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Towards Sufficient {GPU}-accelerated Dynamic Graph
+  Management: Survey and Experiment}.
+\newblock \bibinfo{journal}{\emph{Proceedings of the VLDB Endowment}}
+  \bibinfo{volume}{18} (\bibinfo{year}{2025}), \bibinfo{pages}{599}.
+\newblock
+
+
+\bibitem[Nunes et~al\mbox{.}(2022)]%
+        {csmv}
+\bibfield{author}{\bibinfo{person}{Diogo Nunes}, \bibinfo{person}{Daniel
+  Castro}, {and} \bibinfo{person}{Paolo Romano}.}
+  \bibinfo{year}{2022}\natexlab{}.
+\newblock \showarticletitle{{CSMV}: A Highly Scalable Multi-Versioned Software
+  Transactional Memory for {GPUs}}. In \bibinfo{booktitle}{\emph{IEEE
+  International Parallel and Distributed Processing Symposium (IPDPS)}}.
+  \bibinfo{pages}{526--536}.
+\newblock
+
+
+\bibitem[Sha et~al\mbox{.}(2017)]%
+        {gpma}
+\bibfield{author}{\bibinfo{person}{Mo Sha}, \bibinfo{person}{Yuchen Li},
+  \bibinfo{person}{Bingsheng He}, {and} \bibinfo{person}{Kian-Lee Tan}.}
+  \bibinfo{year}{2017}\natexlab{}.
+\newblock \showarticletitle{Accelerating Dynamic Graph Analytics on {GPUs}}.
+\newblock \bibinfo{journal}{\emph{Proceedings of the VLDB Endowment}}
+  \bibinfo{volume}{11}, \bibinfo{number}{1} (\bibinfo{year}{2017}),
+  \bibinfo{pages}{107--120}.
+\newblock
+
+
+\bibitem[Sha et~al\mbox{.}(2018)]%
+        {gpmatr}
+\bibfield{author}{\bibinfo{person}{Mo Sha}, \bibinfo{person}{Yuchen Li},
+  \bibinfo{person}{Bingsheng He}, {and} \bibinfo{person}{Kian-Lee Tan}.}
+  \bibinfo{year}{2018}\natexlab{}.
+\newblock \showarticletitle{Technical Report: Accelerating Dynamic Graph
+  Analytics on {GPUs}}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:1709.05061v2}}
+  (\bibinfo{year}{2018}).
+\newblock
+
+
+\bibitem[Shen et~al\mbox{.}(2015)]%
+        {prstm}
+\bibfield{author}{\bibinfo{person}{Qi Shen}, \bibinfo{person}{Craig Sharp},
+  \bibinfo{person}{William Blewitt}, \bibinfo{person}{Gary Ushaw}, {and}
+  \bibinfo{person}{Graham Morgan}.} \bibinfo{year}{2015}\natexlab{}.
+\newblock \showarticletitle{{PR-STM}: Priority Rule Based Software Transactions
+  for the {GPU}}. In \bibinfo{booktitle}{\emph{Euro-Par 2015: Parallel
+  Processing}}.
+\newblock
+
+
+\bibitem[Tu et~al\mbox{.}(2013)]%
+        {silo}
+\bibfield{author}{\bibinfo{person}{Stephen Tu}, \bibinfo{person}{Wenting
+  Zheng}, \bibinfo{person}{Eddie Kohler}, \bibinfo{person}{Barbara Liskov},
+  {and} \bibinfo{person}{Samuel Madden}.} \bibinfo{year}{2013}\natexlab{}.
+\newblock \showarticletitle{Speedy Transactions in Multicore In-Memory
+  Databases}. In \bibinfo{booktitle}{\emph{ACM Symposium on Operating Systems
+  Principles (SOSP)}}.
+\newblock
+
+
+\bibitem[Winter et~al\mbox{.}(2018)]%
+        {faimgraph}
+\bibfield{author}{\bibinfo{person}{Martin Winter}, \bibinfo{person}{Daniel
+  Mlakar}, \bibinfo{person}{Rhaleb Zayer}, \bibinfo{person}{Hans-Peter Seidel},
+  {and} \bibinfo{person}{Markus Steinberger}.} \bibinfo{year}{2018}\natexlab{}.
+\newblock \showarticletitle{{faimGraph}: High Performance Management of
+  Fully-Dynamic Graphs Under Tight Memory Constraints on the {GPU}}. In
+  \bibinfo{booktitle}{\emph{International Conference for High Performance
+  Computing, Networking, Storage and Analysis (SC)}}.
+  \bibinfo{pages}{754--766}.
+\newblock
+
+
+\bibitem[Xu et~al\mbox{.}(2014)]%
+        {gpustm}
+\bibfield{author}{\bibinfo{person}{Yunlong Xu}, \bibinfo{person}{Rui Wang},
+  \bibinfo{person}{Nilanjan Goswami}, \bibinfo{person}{Tao Li},
+  \bibinfo{person}{Lan Gao}, {and} \bibinfo{person}{Depei Qian}.}
+  \bibinfo{year}{2014}\natexlab{}.
+\newblock \showarticletitle{Software Transactional Memory for {GPU}
+  Architectures}. In \bibinfo{booktitle}{\emph{IEEE/ACM International Symposium
+  on Code Generation and Optimization (CGO)}}.
+\newblock
+
+
+\bibitem[Zhou et~al\mbox{.}(2024)]%
+        {gtx}
+\bibfield{author}{\bibinfo{person}{Libin Zhou}, \bibinfo{person}{Lu Xing},
+  \bibinfo{person}{Yeasir Rayhan}, {and} \bibinfo{person}{Walid~G. Aref}.}
+  \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{{GTX}: A Write-Optimized Latch-free Graph Data
+  System with Transactional Support -- Extended Version}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2405.01418v2}}
+  (\bibinfo{year}{2024}).
+\newblock
+\newblock
+\shownote{SIGMOD 2025}.
+
+
+\bibitem[Zhu et~al\mbox{.}(2020)]%
+        {livegraph}
+\bibfield{author}{\bibinfo{person}{Xiaowei Zhu}, \bibinfo{person}{Guanyu Feng},
+  \bibinfo{person}{Marco Serafini}, \bibinfo{person}{Xiaosong Ma},
+  \bibinfo{person}{Jiping Yu}, \bibinfo{person}{Lei Xie},
+  \bibinfo{person}{Ashraf Aboulnaga}, {and} \bibinfo{person}{Wenguang Chen}.}
+  \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{{LiveGraph}: A Transactional Graph Storage System
+  with Purely Sequential Adjacency List Scans}.
+\newblock \bibinfo{journal}{\emph{Proceedings of the VLDB Endowment}}
+  \bibinfo{volume}{13}, \bibinfo{number}{7} (\bibinfo{year}{2020}).
+\newblock
+
+
+\bibitem[Zou et~al\mbox{.}(2023)]%
+        {lpma}
+\bibfield{author}{\bibinfo{person}{Lei Zou}, \bibinfo{person}{Fan Zhang},
+  \bibinfo{person}{Yinnian Lin}, {and} \bibinfo{person}{Yanpeng Yu}.}
+  \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{An Efficient Data Structure for Dynamic Graph on
+  {GPUs}}.
+\newblock \bibinfo{journal}{\emph{IEEE Transactions on Knowledge and Data
+  Engineering}} (\bibinfo{year}{2023}).
+\newblock
+\newblock
+\shownote{PKU preprint}.
+
+
+\end{thebibliography}

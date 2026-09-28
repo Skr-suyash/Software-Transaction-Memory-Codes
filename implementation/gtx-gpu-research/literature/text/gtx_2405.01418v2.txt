@@ -1,0 +1,1956 @@
+
+=== PAGE 1 ===
+GTX: A Write-Optimized Latch-free Graph Data System with
+Transactional Support - Extended Version
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+Purdue University
+West Lafayette, Indiana, USA
+{zhou822,xingl,yrayhan,aref}@purdue.edu
+Abstract
+This paper introduces GTX, a standalone main-memory write-
+optimized graph data system that specializes in structural and graph
+property updates while enabling concurrent reads and graph an-
+alytics through ACID transactions. Recent graph systems target
+concurrent read and write support while guaranteeing transaction
+semantics. However, their performance suffers from updates with
+real-world temporal locality over the same vertices and edges due
+to vertex-centric lock contentions. GTX has an adaptive delta-chain
+locking protocol on top of a carefully designed latch-free graph
+storage. It eliminates vertex-level locking contention, and adapts
+to real-life workloads while maintaining sequential access to the
+graph’s adjacency lists storage. GTX’s transactions further support
+cache-friendly block-level concurrency control, and cooperative
+group commit and garbage collection. This combination of features
+ensures high update throughput and provides low latency graph
+analytics. Based on experimental evaluation, in addition to not sac-
+rificing the performance of read-heavy analytical workloads, and
+having competitive performance similar to state-of-the-art systems,
+GTX has high read-write transaction throughput. For write-heavy
+transactional workloads, GTX achieves up to 11× better transaction
+throughput than the best-performing state-of-the-art system.
+CCS Concepts
+• Information systems →Graph-based database models; Data
+management systems; Data locking; Main memory engines.
+Keywords
+Dynamic graph, transaction, latch-free concurrency control
+1
+Introduction
+Managing and querying dynamic graphs have become increas-
+ingly important in many real-world applications, e.g., recommen-
+dation systems, fraud detection, threat detection, geo-spatial navi-
+gation, e-commerce, knowledge graph applications, and risk man-
+agement [10, 17, 18, 55, 62, 72, 87, 90, 103]. Graphs continuously
+change [3, 5, 21, 23, 27, 30, 53, 72, 85, 91] with millions of edge up-
+dates per second [27], e.g., 500 million tweets generated in Twitter
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+GTX Technical Report, arxiv
+© 2025 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-x-xxxx-xxxx-x/YYYY/MM
+https://doi.org/10.1145/nnnnnnn.nnnnnnn
+per day [21]. Applications require transactions to update multi-
+ple vertices and edges [72], e.g., in ByteDance services [8], when
+a user creates an article, a transaction atomically inserts 3 edges:
+(user, article), (user, tag), (article, tag). Without transactions, updates
+can corrupt the data [35], e.g., violating the reciprocal consistency
+that requires atomically updating two edges between a pair of ver-
+tices [35, 102]. At the same time, dynamic graphs need to support
+graph analytics [36, 39, 52, 72, 111]. ByteDance [8] detects fraud,
+and manages risk via subgraph pattern-matching that may traverse
+multiple hops while the graph is being updated concurrently [72].
+Without transactional atomicity, consistency, and isolation, graph
+analytics algorithms, originally designed for static graphs, cannot
+be run [52], and may yield incorrect results [35, 39] and security
+vulnerabilities [35, 101], e.g., an access control system needs to
+update access permissions of roles and entities atomically [35, 101].
+Without transactional guarantees, users may obtain incorrect per-
+missions, and malicious users can exploit race conditions to trigger
+vulnerabilities. Graph systems, e.g., [44, 64, 78], that do not sup-
+port transactions cannot run graph analytics concurrently with
+updates [52]. Recent graph data systems, e.g., [39, 52, 111], support
+mixed transactions and analytics workloads.
+Experiments [52] show that the performance of state-of-the-art
+transactional graph systems [39, 52, 111] suffer significantly when
+workloads follow real-world update patterns. Many real-world sce-
+narios exhibit power-law graphs with vertex degrees following
+power-law distribution [33, 34, 46, 96, 111], and super vertices (hub
+vertices) [52, 72]) having large degree. Also, real-world graph work-
+loads have hotspots, and their edge updates have temporal local-
+ity [52, 65]. These update patterns cause not only updates to the
+same vertex’s adjacency list to be temporally close to each other,
+but also create congestion of large amounts of concurrent updates
+at the same vertices (i.e., hub vertices becoming hotspots [72]).
+Vertex-centric locking and the lack of lock-free synchronization
+cause significant degradation in transaction throughput [52].
+Latch-free indexes, e.g., [24, 25, 66, 70, 71, 74, 100, 110], eliminate
+locks and blocking, and hence offer higher concurrency. They rely
+on atomic hardware primitives, e.g., compare_and_swap (CAS) and
+fetch_add to serialize updates, but by themselves, do not support
+transactions [70]. The Bw-Tree [70, 100] does not prevent write-
+write conflicts or provide transaction atomicity and consistency. It
+requires a separate transaction protocol [42] to handle transactions.
+This paper studies realizing a high-throughput transactional
+graph data system, GTX1, using a latch-free graph store and mul-
+tiversion concurrency control 𝑀𝑉𝐶𝐶[107]. GTX is a latch-free
+write-optimized main-memory transactional graph system support-
+ing highly concurrent read-write transactions and graph analytics.
+1The source code can be found at: https://github.com/Jiboxiake/GTX-SIGMOD2025
+arXiv:2405.01418v2  [cs.DB]  24 Feb 2025
+
+=== PAGE 2 ===
+GTX Technical Report, 2025, arxiv
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+GTX has a cache-friendly latch-free 𝑀𝑉𝐶𝐶dynamic graph stor-
+age managed and accessed completely by non-blocking atomic
+primitives. It combines pointer-based and sequential delta-chain
+storage for efficient edge lookup and adjacency list scans. It uses
+vector-based delta-chains indexes to locate target edges efficiently
+while preserving cache-effective sequential adjacency lists. GTX’s
+storage is optimized for power-law edge distributions and hub ver-
+tices that are prominent in real-world graphs [52, 111]. GTX has
+an efficient transaction protocol for the underlying latch-free data
+structure and dynamic graph workload. GTX eliminates vertex- and
+edge-centric locks, and has an adaptive delta-chain locking protocol.
+GTX adapts to the temporal locality and hotspots of edge updates
+by increasing concurrency for “hot" vertices with higher memory
+cost, and reducing concurrency for the “cold" vertices. To exploit
+the high concurrency provided by latch-free 𝑀𝑉𝐶𝐶and adaptive
+concurrency control, GTX has a low-latency hybrid group commit
+protocol and cooperative 𝑀𝑉𝐶𝐶garbage collection. GTX exhibits
+a cooperative worker thread design. Except for a single commit
+manager thread, GTX has no service threads. GTX worker threads
+install committed transactions’ updates, and collect garbage while
+executing each thread’s own transactions.
+Experiments demonstrate that GTX achieves up to 2× and 11×
+higher transaction throughput than the best competitor in random
+order power-law graph edge insertions and in real-world timestamp-
+ordered power-law graph edge insertions, respectively. For con-
+current transaction and graph analytics workloads, GTX has up to
+5.3× higher throughput in edge update transactions for write-heavy
+workloads, and 3.7× higher throughput for read-write balanced
+workloads over the best competitor systems. The trade-off is that
+GTX takes between 0.95× to 2× longer time than the best perform-
+ing system to execute most of the concurrent graph analytics, but
+still performs reasonably well for the majority of the workloads.
+The contributions of this paper are as follows. We introduce GTX,
+a write-optimized transactional graph system with high transac-
+tion throughput. GTX has a latch-free graph storage that leverages
+existing techniques of latch-free indexes, and is optimized for adja-
+cency list storage of dynamic graphs. GTX has a delta chains-based
+adaptive 𝑀𝑉𝐶𝐶, combining pointer-based delta-chains storage and
+sequential storage to provide both efficient single edge lookup and
+adjacency list scans. GTX has a high-throughput transaction pro-
+tocol equipped with a hybrid commit protocol, and cooperative
+garbage collection suited for latch-free multi-versioning storage.
+GTX concurrency control dynamically adapts to real-world up-
+date patterns, temporal localities, and hotspots, and eliminates the
+need for vertex- or edge-centric locking commonly used in graph
+systems. Our experiments demonstrate that GTX achieves up to
+11x higher read-write transaction throughput while maintaining
+competitive graph analytics latency concurrently.
+The rest of this paper proceeds as follows. Section 2 discusses
+related work on dynamic graph systems. Section 3 overviews GTX.
+Sections 4 - 9 present GTX’s graph store, transaction operations
+and transaction management. Section 10 presents an extensive
+experimental study. Finally, Section 11 concludes the paper.
+2
+Related Work
+Data systems have been developed for graph data management and
+analytics [1, 2, 6, 11, 15, 18, 27–29, 31, 32, 36, 40, 41, 43, 44, 47–51, 54,
+56, 58, 60, 61, 64, 69, 72, 73, 77, 78, 80, 81, 84, 86, 89, 93–95, 97, 104–
+106]. Transactional graph systems [39, 52, 111] execute read-write
+transactions and analytics on dynamic graphs concurrently.
+LiveGraph [111], a main-memory graph data system, supports
+graph analytics and read-write transactions. LiveGraph adopts an
+adjacency list-based edge storage model, and uses a vertex array
+index storing pointers to vertex versions and edge blocks. LiveG-
+raph supports MVCC. Read-write transactions acquire exclusive
+locks on vertices, and create a new version to update a vertex,
+and append a new update log to update an edge. Readers do not
+need locks, and directly scan the memory block utilizing trans-
+action timestamps to read the visible versions. LiveGraph stores
+edge versions of the same source vertex consecutively in the same
+memory block and enables purely sequential adjacency list scans.
+LiveGraph’s sequential storage of adjacency lists is cache-friendly,
+reduces random memory access and pointer chasing, and facili-
+tates prefetching [39, 52, 111]. It enables efficient graph analytics.
+LiveGraph’s edge block lacks indexes, and scans the whole block
+for edge lookups and updates (that need to invalidate old edge
+versions). Also, LiveGraph’s vertex-centric locks block concurrent
+transactions from writing to the same vertex’s adjacency list even
+if they may be updating different edges. Despite competitive graph
+analytics performance, LiveGraph suffers from low transaction
+throughput as shown in our experiments in Section 10. GTX uses a
+similar adjacency list-based MVCC storage model indexed by vertex
+ID, but overcomes these challenges through 1) A latch-free graph
+storage (Section 4), 2) A delta-chains-based edge multi-versioning
+and index within edge-deltas blocks (Sections 4.2, 5.2-5.4), 3) A
+new high-throughput read-write ACID transaction protocol with
+delta-chain-based concurrency control (Section 6), 4) A cooperative
+safe-timestamp-based garbage collection technique during normal
+transaction operations (Section 9).
+Teseo [39] stores graph vertices and their adjacency lists in dy-
+namic large sparse arrays [38] inside leaf nodes of a “fat" B+-tree
+to provide both efficient updates and adjacency list reads. Teseo
+has a clustered sparse index on keys in each sparse array segment
+to support fast point lookup of vertices and edges, and secondary
+indexes on vertex locations in the segments to initiate adjacency list
+scans. Teseo has a hybrid latch per sparse array segment that com-
+bines conventional and optimistic latches to support single-writer
+multi-reader semantics, and reduces concurrency control overhead
+in read-intensive workloads. A read-only or read-write transaction
+can acquire a latch either conventionally or optimistically based on
+the desired operation and transaction type. Teseo spawns service
+threads for sparse array and B+-tree structure modifications. When
+a segment in a sparse array is full, Teseo requires a service thread to
+determine a rebalance window of multiple segments in the sparse
+array, lock them, and redistribute entries among these segments.
+A sparse array resize either creates a new sparse array as the leaf
+or splits the leaf into two new sparse arrays. These operations re-
+quire locking multiple memory blocks exclusively. Transactions
+that do not conflict with normal operations may conflict in locking
+neighbor segments that may cause threads to block and stall. Also,
+
+=== PAGE 3 ===
+GTX: A Write-Optimized Latch-free Graph Data System with Transactional Support - Extended Version
+GTX Technical Report, 2025, arxiv
+multiple threads may compete in locking segments for rebalanc-
+ing. Maintaining service threads also increases computing resource
+contention. Experiment results in Section 10.1 show that Teseo suf-
+fers the most performance degradation in workloads with hotspots
+due to contentions during structure modifications. GTX overcomes
+these through 1) A cooperative design with no service thread except
+a single commit manager. GTX’s structure modification (edge-deltas
+block consolidation) and garbage collection are handled by worker
+threads cooperatively during runtime (Sections 6 and 9). 2) GTX’s
+state-based block-protection protocol designates one worker thread
+to clean one memory block to reduce contention. Worker threads
+do not compete to lock memory blocks (Sections 6.2 and 6.3).
+Sortledton [52] is a graph data structure optimized for the access
+patterns popular in graph analytics. It organizes vertices in a 2-level
+vector index and stores sorted adjacency lists in vectors and edge
+blocks for better read performance at the expense of maintaining the
+sort during updates. For hub vertices, Sortledton has a concurrent
+unrolled skiplist [82] to store blocks of edges in sorted sets, where
+each skiplist element is an edge block. Sortledton’s transactions
+support scan and set operations on adjacency lists and concurrent
+vertex/edge updates. However, Sortledton requires transactions to
+know in advance their read and write sets, and lock them following
+a global order beforehand through vertex locking. Transactions
+need to complete all their reads before doing any writes. GTX’s
+ACID transaction protocol does not require knowing read sets and
+write sets beforehand. A GTX transaction can execute reads and
+writes in any order during runtime (Section 6). Moreover, GTX’s
+delta-chains-based concurrency control eliminates vertex-centric
+locking (Section 6.1) to provide better concurrency.
+Latch-free indexes and systems [24, 25, 42, 66, 67, 70, 71, 74, 99,
+108, 110] use atomic operations, e.g.,𝐶𝐴𝑆and fetch_add, to serialize
+concurrent operations. GTX uses atomic operations and delta-based
+multi-versions for concurrent lock-free reads and to resolve write-
+write conflicts. It has sequential memory blocks for adjacency lists
+as in [100, 111] to amortize the cost of delta allocations. Deltas are
+stored sequentially to reduce random access.
+3
+Overview of GTX
+Figure 1: GTX Overview: Transactions and graph store
+GTX manages and queries dynamic labeled property graphs [57],
+where edges can contain labels, e.g., as in [111]. Fuchs et al. [52]
+microbenchmark the popular access patterns in graph workloads.
+Major takeaways from their study are: (1) Storing neighbors of
+all vertices together (sequential vertex access) is beneficial but is
+not necessary. (2) Sequential access to each vertex’s adjacency list
+enables better performance. (3) A dense vertex identifier domain
+has better performance for graph analytics than a sparse domain.
+(4) Some graph algorithms access vertices in random order and
+require a vertex index. Given these findings, we make several de-
+sign decisions. GTX uses an adjacency-list-like structure, and stores
+edges of a vertex sequentially in memory blocks (Section 4.2). GTX
+uses a vertex index for fast lookup, and an atomic integer on a dense
+domain to manage vertex IDs. For atomicity, consistency, and isola-
+tion, graph updates and analytics are executed under read-write or
+read-only transactions with snapshot isolation [26, 107]. Transac-
+tions support vertex and edge reads, adjacency list scans, and writes
+(insert, update, and delete). Graph analytics invoke adjacency list
+scans iteratively via a read-only transaction. GTX supports graphs
+with uniform and power-law edge distribution but is optimized for
+power-law graphs. Figure 1 gives an overview of GTX’s storage and
+constructs for transactions. The colored portion in gray corresponds
+to GTX’s graph storage and the uncolored portion corresponds to
+GTX’s transaction protocol with auxiliary data structures.
+Figure 2: Vertex Delta and Operations
+4
+GTX Storage
+GTX is a main-memory MVCC graph data system. Similar to other
+𝑀𝑉𝐶𝐶-based systems [39, 42, 52, 67, 75, 111], GTX stores vertex
+and edge updates into deltas, links deltas of the same object, and
+manages deltas’ lifespan and visibility through timestamps. GTX
+uses a multi-versioning design similar to Hekaton [42], Cicada [75],
+and LiveGraph [111]. Each of GTX delta’s visibility and lifespan are
+managed by creation and invalidation timestamps. A delta’s lifespan
+is the time between its creation and its invalidation timestamps
+(that is infinity for the latest version delta). A transaction 𝑇is
+assigned a read timestamp (𝑟𝑡𝑠), and can read all deltas whose
+lifespan overlaps 𝑇’s 𝑟𝑡𝑠. 𝑇creates deltas to update vertices and
+edges. Deltas of the same vertex or edge are linked forming version
+chains. The beginning of the version chain is the most recent delta.
+GTX enforces that every delta has the same creation timestamp as
+the invalidation timestamp of the delta right after it.
+4.1
+Vertex-centric Index
+GTX uses a dense vertex domain, and maintains a vertex index. Fig-
+ure 1’s colored portion (in gray) illustrates GTX’s storage. Sortled-
+ton shows the benefits of having vector-based vertex table for graph
+storage [52]. GTX designs a similar latch-free two-level vector-
+based vertex index. Level-1 stores pointers to Level-2 in a fixed-size
+array. Level-2 has vertex index vector segments that are of the same
+
+=== PAGE 4 ===
+GTX Technical Report, 2025, arxiv
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+size (or growing sizes). A transaction atomically fetch_adds a global
+offset variable, and uses the return value as the ID of a new vertex,
+say 𝑣. The corresponding Level-2 entry in the vertex index points to
+𝑣and its edge versions. The initial vertex index has only 1 pointer
+in Level-1 and allocates 1 Level-2 vector. When the vector runs out
+of entries, the transaction creating the first vertex that resides in
+the next vector allocates the next Level-2 vector, and claims its first
+entry. Other concurrent transactions creating vertices that need
+to be in the next vector will wait until the corresponding pointer
+in Level-1 is initialized. When GTX rarely runs out of space to
+allocate more vertex index entries, it allocates a new Level-1 array
+with double the size, and copies all vector pointers there similar
+to dynamic array expansion. The benefits are two-fold. Breaking
+the Level-2 vectors into segments managed by pointers reduces
+memory waste of allocating a single large vector. Level-2 vector ex-
+tension avoids explicitly copying/touching vector contents and only
+requires appending a new segment. Meanwhile, GTX still main-
+tains 𝑂(1) vertex lookup. 𝑣’s vertex index entry can be retrieved at
+𝑉[𝑖][𝑗]: 𝑖= 𝑣/𝑐and 𝑗= 𝑣𝑚𝑜𝑑𝑐, where 𝑐is the size of each Level-2
+vector segment.
+A vertex index entry stores an atomic pointer to the head of
+the vertex delta-chain. Figure 2 shows an example of Vertex 20
+(V20), ignoring the parts in red for now. V20 has 2 versions, 𝑑𝑒𝑙𝑡𝑎_0
+created and invalidated at timestamps 1987 and 3001 and 𝑑𝑒𝑙𝑡𝑎_1
+created at timestamp 3001. Each vertex delta stores how many
+bytes its vertex property takes, and stores the property data inline.
+𝑑𝑒𝑙𝑡𝑎_0 does not store its invalidation timestamp and infers it from
+𝑑𝑒𝑙𝑡𝑎_1’s creation timestamp. Each vertex delta stores a pointer to
+the previous delta of the same vertex, forming a delta chain.
+4.2
+Edge Deltas Storage
+The second pointer in each vertex index entry points to an edge
+label block. GTX stores all edges of the same source vertex and label
+in an edge-deltas block. It stores one entry per label pointing to
+an edge-deltas block and its associated delta-chains index, version
+number, and state variable (Detailed in Sections 5, 6). It manages
+all label entries in an array. We use 2 atomic variables per edge
+label block to manage and access the block in a latch-free manner.
+The first atomic offset variable controls which entries are valid in
+the array, and the other atomic pointer points to the next block
+to allocate more labels (initially null). A transaction allocates a
+new label entry by incrementing the atomic offset, and uses the
+corresponding array entry to store the new label. If the array is full,
+it will allocate the next block and update the pointer. A transaction
+looking up an label entry simply scans the array. To accommodate
+concurrent updates, it reads the offset before and after the scan,
+and will reinitiate the scan if the offset has been updated. The
+experiment datasets and our latter discussion assume the graph
+contains only 1 label and omits showing labels for brevity.
+Figure 3’s contents in black illustrate V20’s edge-deltas block
+and delta-chains index. GTX’s edge-deltas block has similar storage
+layout to that of LiveGraph [111] and improves it with atomic mem-
+ory allocation, edge delta-chains, and hybrid property data storage.
+At the lowest address, the header stores the block’s metadata, e.g.,
+creation time. Then, a property data storage section stores each
+edge delta’s variable-sized property data. Fixed-sized edge deltas
+are stored at the opposite end of the block. Edge deltas are logically
+linked in different edge delta-chains. Each block has a delta-chains
+index whose 𝑖𝑡ℎentry stores the offset of the 𝑖𝑡ℎedge delta-chain’s
+head. The combined_offset combines the offsets of the latest edge
+delta and property data in a 64-bit integer that can be atomically
+updated by the hardware without a latch. It enables atomically allo-
+cating memory for both the edge delta and its property in a single
+operation. Its higher 32 bits store the offset of the property data re-
+gion and the lower 32 bits store the offset of the edge deltas region,
+extending from single direction space preallocation in Open Bw-
+tree [100], and latch-based allocation in LiveGraph [111]. Silo [99]
+and Tictoc [108] also store multiple objects in a single atomic word
+to enable atomic multi-reads and multi-writes.
+Each edge delta takes 1 cache line (64 bytes) to avoid false shar-
+ing among concurrent writers. It stores a write operation and the
+creation and invalidation timestamps for multi-versioning. An edge
+delta’s previous_offset points to the previous edge delta on the delta
+chain. At an edge-deltas block’s creation time, GTX determines its
+edge delta-chain number, where transactions append edge deltas
+to different delta chains using a hash function. Hekaton [42, 67]
+also maintains linked lists of all versions in the same hash bucket
+(may be different objects). GTX’s novelty lies in the combination
+of pointer-based delta linking and sequential storage preallocation.
+Its delta linking serves as an index for efficient single edge delta
+lookup and all edge deltas of the same vertex are still stored sequen-
+tially in one memory block to preserve localities in adjacency list
+scans. Such a locality-preserving sequential storage proves to be
+beneficial for the graph analytics [39, 52, 76, 95, 111]. Finally, GTX
+delta chain storage and delta-chains index are tightly coupled with
+concurrency control (Sction 6.1). Each edge delta also stores the
+offset of the same edge’s previous edge delta to support efficient
+visible version lookup. Given a target edge 𝑒, a reader transaction
+locates 𝑒’s edge delta-chain, and uses edge deltas’ previous_offset
+and previous_version_offset to locate 𝑒’s visible version. Edge delta’s
+data size and data offset locate its edge property data. We extend
+Cicada’s best-effort inlining [75] and take advantage of “wasted"
+space in each cache line-aligned edge delta to design a hybrid stor-
+age scheme for its variable-sized property. If the property size is
+small, e.g., ≤16 bytes, it is stored in the cache line-aligned edge
+delta to save space and reduce random memory access, else it is
+stored in the data region. In contrast to Cicada’s inlining that only
+applies to one version and has management overheads, every GTX
+edge delta can store property data inline to save space and improve
+cache performance. Because each edge delta’s inline data region is
+allocated regardless of the property size for cache-line alignment,
+there is no extra overhead for GTX’s hybrid storage scheme.
+In the example, V20 has 3 edges: 𝑒(20, 4), 𝑒(20, 3), and 𝑒(20, 5)
+(𝑖𝑛𝑠𝑒𝑟𝑡edge deltas) and maintains 2 edge delta-chains. Its delta re-
+gion takes 192 bytes and data region takes 64 bytes (combined_offset).
+𝑒(20, 4) and 𝑒(20, 3) have 32 bytes of property data each stored in
+the data region (Offsets 0 and 32). 𝑒(20, 5) stores its 8-byte weight in-
+line in the edge delta.𝑑𝑒𝑙𝑡𝑎_𝑐ℎ𝑎𝑖𝑛_0 contains 1 edge delta𝑑(4, 𝐼𝑁𝑆)
+at Offset 64, and𝑑𝑒𝑙𝑡𝑎_𝑐ℎ𝑎𝑖𝑛_1 contains 2 edge deltas𝑑(3, 𝐼𝑁𝑆) and
+𝑑(5, 𝐼𝑁𝑆) starting at Offset 192. The middle section is free space.
+
+=== PAGE 5 ===
+GTX: A Write-Optimized Latch-free Graph Data System with Transactional Support - Extended Version
+GTX Technical Report, 2025, arxiv
+Figure 3: Edge-deltas Block and Edge Operations
+5
+Graph Transaction Operations
+GTX transactions support vertex and edge insert, delete, and update,
+single vertex/edge lookup, and adjacency list scan. In this section,
+we persent transaction operations, and defer transaction manage-
+ment (e.g., concurrency control, commit) to Section 6. Let 𝑐𝑡𝑠, 𝑖𝑡𝑠,
+𝑟𝑡𝑠, and 𝑤𝑡𝑠be the creation, invalidation, read, and write/commit
+timestamps, respectively. At creation time, each transaction gets
+an 𝑟𝑡𝑠and can see all deltas with overlapping lifespans. For writes,
+transactions create deltas with transaction IDs as timestamps, and
+update them with 𝑤𝑡𝑠at commit time.
+5.1
+Vertex Read and Update
+GTX transactions update vertices through creating vertex deltas,
+and read them by finding/reading visible deltas using atomic load
+and 𝐶𝐴𝑆. Refer to the same example of V20 in Figure 2 including
+the red parts. Assume that Transaction 𝑡with 𝑟𝑡𝑠= 2000 looks up
+V20. After fetching V20’s delta chain pointer from the vertex index,
+𝑡checks the delta chain head 𝑑𝑒𝑙𝑡𝑎_1, and finds its 𝑐𝑡𝑠is larger
+than 𝑡’s 𝑟𝑡𝑠. Thus, 𝑡uses the previous pointer to locate 𝑑𝑒𝑙𝑡𝑎_0
+with 𝑐𝑡𝑠= 1987. 𝑡determines 𝑑𝑒𝑙𝑡𝑎_0 is visible, and reads it. If a
+newer transaction 𝑡2 with 𝑟𝑡𝑠= 4000 also reads V20, 𝑡2 will read
+𝑑𝑒𝑙𝑡𝑎_1. Assume that a read-write transaction 𝑡𝑥𝑛_𝑥updates V20.
+Similarly, it loads the delta chain head as in the read operation.
+𝑡𝑥𝑛_𝑥checks 𝑑𝑒𝑙𝑡𝑎_1’s 𝑐𝑡𝑠, and makes sure it is not a transaction
+ID, nor larger than 𝑡𝑥𝑛_𝑥’s 𝑟𝑡𝑠. Else, 𝑡𝑥𝑛_𝑥immediately aborts due
+to a write-write conflict. 𝑡𝑥𝑛_𝑥creates a new vertex delta 𝑑𝑒𝑙𝑡𝑎_2
+with the updated property, and stores𝑡𝑥𝑛_𝑥as its𝑐𝑡𝑠.𝑑𝑒𝑙𝑡𝑎_2 stores
+a pointer to 𝑑𝑒𝑙𝑡𝑎_1. Then, 𝑡𝑥𝑛_𝑥invokes 𝐶𝐴𝑆to update the vertex
+delta-chain pointer to point to 𝑑𝑒𝑙𝑡𝑎_2. If 𝐶𝐴𝑆fails, 𝑡𝑥𝑛_𝑥aborts
+due to write-write conflict. Else, 𝑡𝑥𝑛_𝑥commits at 𝑤𝑡𝑠= 3650, and
+updates 𝑑𝑒𝑙𝑡𝑎_2’s 𝑐𝑡𝑠to its 𝑤𝑡𝑠. This applies to vertex insert and
+property update. Deletes are covered in Section 5.5.
+While using a pointer-based delta chain and 𝐶𝐴𝑆is less efficient
+due to pointer chasing, random memory access and competing
+𝐶𝐴𝑆[100], vertex updates are less frequent than edge updates [111],
+hence less conflicts from concurrent updates. Also, most transac-
+tions need access to only the latest version of a vertex, and will
+access it with a single pointer chase. Thus, the negative effects of
+this design are minimal. On the other hand, detecting write-write
+conflicts to the same vertex becomes simple. A failed 𝐶𝐴𝑆indicates
+a concurrent transaction has updated the vertex delta chain.
+5.2
+Edge Update
+GTX transactions update edges by creating edge deltas (insert,
+update, and delete) in edge-deltas blocks. GTX supports directed
+graphs using 2 labels and 2 edge-deltas blocks per vertex for fanin
+and fanout edges. Undirected graphs store each edge twice in both
+vertices’ edge-deltas blocks as in [39, 52].
+Refer to the example of V20’s edge-deltas block in Figure 3. Col-
+ors refer to transactions’ updates, e.g., Transaction𝑇1’s updates are
+in dark blue. Assume that 𝑇1 with 𝑟𝑡𝑠= 9 updates 𝑒(20, 10) with a
+new 32-bytes property. First, it calculates that 𝑒(20, 10) belongs to
+𝑑𝑒𝑙𝑡𝑎_𝑐ℎ𝑎𝑖𝑛_0 by 10 𝑚𝑜𝑑2 = 0, where the number of delta chains
+in this block is 2.𝑇1 reads the delta-chains index, finds the offset 64,
+and checks the edge delta at this location. 𝑇1 sees 𝑑(4, 𝐼𝑁𝑆) has a
+smaller 𝑐𝑡𝑠than its 𝑟𝑡𝑠, so it decides to lock 𝑑𝑒𝑙𝑡𝑎_𝑐ℎ𝑎𝑖𝑛_0 (covered
+in Section 6.1). After 𝑇1 successfully locks 𝑑𝑒𝑙𝑡𝑎_𝑐ℎ𝑎𝑖𝑛_0, it uses
+each edge delta’s previous_offset to look for the previous version
+of 𝑒(20, 10), that in this example does not exist. A lookup of the
+previous version is necessary to avoid creating duplicate edges and
+link versions together. Delta-chains index enables efficient lookup
+of edges. Since the new edge version has a 32-bytes property, 𝑇1
+needs to store the property in the data region. Then, it invokes the
+delta allocation protocol (32 bytes for data and 64 bytes for delta
+regions) to update the combined_offset, and creates the correspond-
+ing edge delta with 𝑐𝑡𝑠= 𝑇1, 𝑡𝑦𝑝𝑒= 𝐼𝑁𝑆, previous_offset pointing
+to 𝑑(4, 𝐼𝑁𝑆), no previous_version_offset, data size equaling 32, and
+data offset equaling 64. When𝑇1 is committing, it updates the delta-
+chains index entry to point to 𝑑(10, 𝐼𝑁𝑆), releases the delta-chain
+lock, gets its 𝑤𝑡𝑠= 10, and updates 𝑑(10, 𝐼𝑁𝑆)’s 𝑐𝑡𝑠= 10.
+The example also shows 2 other transactions 𝑇2 and 𝑇3 delet-
+ing 𝑒(20, 4) and updating 𝑒(20, 5) with a weight 40.1. 𝑇2 follows
+similar procedures as 𝑇1 with a few differences. 𝑇2 deletes an ex-
+isting edge, so it fetches 𝑑(4, 𝐼𝑁𝑆) and puts transaction ID 𝑇2 in
+𝑑(4, 𝐼𝑁𝑆)’s 𝑖𝑡𝑠. 𝑇2 also writes 𝑑(4, 𝐼𝑁𝑆)’s offset 64 in 𝑑(4, 𝐷𝐸𝐿)’s
+previous_version_offset to link versions. During commit, 𝑡2 writes
+its 𝑤𝑡𝑠= 12 to 𝑑(4, 𝐷𝐸𝐿)’s 𝑐𝑡𝑠and 𝑑(4, 𝐼𝑁𝑆)’s 𝑖𝑡𝑠. 𝑇3 updates
+𝑒(20, 5) with a new 8-bytes weight and works similarly as 𝑇2. The
+difference is that the new weight is stored inline in 𝑑(5,𝑈𝑃𝐷). 𝑇1
+stores it in the data region and𝑇2’s 𝑑(4, 𝐷𝐸𝐿) has no property data.
+
+=== PAGE 6 ===
+GTX Technical Report, 2025, arxiv
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+5.3
+Edge Lookup
+GTX supports single edge lookup given (𝑠𝑟𝑐,𝑑𝑠𝑡,𝑙𝑎𝑏𝑒𝑙). The 𝑠𝑟𝑐
+and 𝑙𝑎𝑏𝑒𝑙locate the edge-deltas block and its delta-chains index.
+Then, each reader transaction 𝑡calculates the edge delta-chain
+from 𝑑𝑠𝑡, and reads its deltas. After finding a delta with a match-
+ing 𝑑𝑠𝑡, 𝑡compares its 𝑟𝑡𝑠with the delta’s lifespan, and uses the
+previous_version_offset to locate the visible version if needed.
+Refer to the same example in Figure 3. The colors of arrows
+represent the search path of each transaction. Transaction 𝑇4 with
+𝑟𝑡𝑠= 15 looks up 𝑒(20, 3). After locating the edge-deltas block, 𝑇4
+calculates 𝑒(20, 3) belongs to 𝑑𝑒𝑙𝑡𝑎_𝑐ℎ𝑎𝑖𝑛_1 by 3 𝑚𝑜𝑑2 = 1. 𝑇4
+reads the offset (384) from the index, and finds 𝑑(5,𝑈𝑃𝐷), the head
+of 𝑑𝑒𝑙𝑡𝑎_𝑐ℎ𝑎𝑖𝑛_1. Then, 𝑇4 reads 𝑑(5,𝑈𝑃𝐷)’s previous_offset to
+search the delta chain. After reading 𝑑(5, 𝐼𝑁𝑆)’s previous_offset, 𝑇4
+finds 𝑑(3, 𝐼𝑁𝑆), and checks its 𝑐𝑡𝑠and 𝑖𝑡𝑠. 𝑇4 determines 𝑑(3, 𝐼𝑁𝑆)
+is visible, and uses its data offset 32, and the data size 32 bytes to read
+the edge property accordingly. Transactions 𝑇5 with 𝑟𝑡𝑠= 15 and
+𝑇6 with 𝑟𝑡𝑠= 10 both look up 𝑒(20, 4). After reading 𝑑(4, 𝐷𝐸𝐿) of
+𝑑𝑒𝑙𝑡𝑎_𝑐ℎ𝑎𝑖𝑛_0, 𝑇5 determines that 𝑑(4, 𝐷𝐸𝐿) is visible, and reports
+𝑒(20, 4) being deleted. 𝑇6 sees 𝑑(4, 𝐷𝐸𝐿)’s 𝑐𝑡𝑠= 12, larger than its
+𝑟𝑡𝑠= 10. Therefore, it uses 𝑑(4, 𝐷𝐸𝐿)’s previous_version_offset 64
+to find 𝑑(4, 𝐼𝑁𝑆), verifies its 𝑟𝑡𝑠overlaps with 𝑑(4, 𝐼𝑁𝑆)’s lifespan,
+and reads the 32 bytes property data of 𝑒(20, 4).
+5.4
+Adjacency List Scan
+GTX supports sequential adjacency list scan given (𝑠𝑟𝑐,𝑙𝑎𝑏𝑒𝑙). Af-
+ter locating the edge-deltas block, a transaction loads the com-
+bined_offset to determine where to start the scan, and scans every
+edge delta in the block. It compares its 𝑟𝑡𝑠with each delta’s lifespan,
+and returns visible edge deltas. We use an iterator model for adja-
+cency list scans, and graph analytics directly accessing each block.
+In Figure 3, Transaction 𝑇7 with 𝑟𝑡𝑠= 20 scans V20’s adjacency
+list. It loads the combined_offset, determines the edge deltas start
+at Offset 384, and reads every edge delta from there. It reports V20
+has edges 𝑒(20, 5) with Weight 40.1, 𝑒(20, 10) and 𝑒(20, 3).
+5.5
+Vertex Delete
+Vertex deletion is an expensive but necessary operation in graph sys-
+tems. Recent graph database benchmarks LDBC-SNB-Interactive-
+v2 [14, 83] and LDBC-SNB-BI [13, 98] include deep cascading dele-
+tion operations. Deleting a vertex requires removing all its adjacent
+edges atomically. It preserves graph consistency by avoiding dan-
+gling edges. Therefore, GTX’s vertex deletion contains three steps:
+(1) Vertex Locking, (2) Vertex Delete, and (3) Edge Delete. Vertex
+Locking puts the vertex in an exclusive state, and thus preventing
+other transactions from reading or writing the vertex or its edges.
+Vertex Delete deletes the vertex, and Edge Delete deletes all its
+edges. Here, we illustrate how to delete Vertex V20. To delete V20,
+Transaction 𝑡𝑑puts V20 in an exclusive delete state, and installs a
+special vertex-delete delta. At this moment, V20 and edges in its
+edge-deltas blocks are considered as being deleted. Then, 𝑡𝑑scans
+V20’s adjacency list (edge-deltas block) to identify its edges and
+deletes these “reverse" edges in V20’s neighbors’ adjacency lists
+using edge delete operations (Section 5.2). 𝑡𝑑also adds V20 into
+its thread-local recycled vertex list. After the vertex’s deltas and
+edge-deltas blocks have been garbage collected (detailed in Sec-
+tion 9), V20 can be reallocated to accommodate future workloads.
+GTX currently only allows one vertex delete at a time, and we find
+this enough for vertex delete requirements, and it simplifies con-
+currency control. LDBC-SNB benchmarks have less than 1% writes
+as deletes, and vertex deletes are a minority among them [7, 83, 98].
+More on vertex delete, including exclusive delete state, is presented
+in Section 6.6.
+6
+Transaction Management
+GTX allocates a set of worker threads that execute transactions.
+Each thread executes its own transactions while being cooperative,
+i.e., performing work on behalf of other transactions. For analytical
+workloads, GTX uses OpenMP [16] threads to collectively execute
+a single read-only transaction. GTX supports ACID transactions.
+GTX transactions can execute multiple read and write operations
+atomically and ensure no dangling or duplicate edges. GTX supports
+Snapshot Isolation (SI) transactions [26] based on 𝑀𝑉𝐶𝐶[107], the
+only supported isolation level of LiveGraph [111] and Teseo [39],
+and stronger than the state-of-the-art graph DBMS Neo4j’s default
+Read Committed [9]. We find SI sufficient for graph workload. State-
+of-the-art graph benchmarks LDBC-SNB-Interactive-v1 [45] and
+v2 [83] require read committed and SI, respectively. GTX manages
+two variables for SI and MVCC: Global read epoch(𝑔𝑟𝑒) and Global
+write epoch(𝑔𝑤𝑒) as in LiveGraph [111]. Silo [99] designs an epoch-
+based transaction protocol but GTX is only similar in resource
+management. A GTX transaction acquires its 𝑟𝑡𝑠from 𝑔𝑟𝑒when
+created, and gets assigned a 𝑤𝑡𝑠from 𝑔𝑤𝑒at commit time. Under
+SI, GTX transactions have no read-write conflicts, and only need to
+detect write-write conflicts. As in Section 5.1, we use 𝐶𝐴𝑆to detect
+vertex update conflicts. In Sections 6.1, 6.2, we discuss concurrency
+control for edge delta-chains and edge-deltas blocks. Every trans-
+action can see all deltas created, but not invalidated by itself by
+storing and checking transaction IDs in delta timestamps. A GTX
+transaction 𝑡only updates the latest versions: 𝑡compares the latest
+delta’s 𝑐𝑡𝑠of the object 𝑡intends to update. 𝑡can update only if the
+latest delta is not an in-progress delta of another transaction and
+the delta’s lifespan overlaps 𝑡.𝑟𝑡𝑠. GTX supports redo logging and
+checkpoint for durability.
+6.1
+Adaptive Delta-Chain Locking
+Section 5.2 shows that a transaction 𝑡needs to lock edge delta-
+chains before installing edge deltas. Locking delta chains enables
+concurrent updates to different edges in the same edge-deltas block
+and detect write-write conflicts: Updates to the same edges. Delta
+chain granularity locking is a middle ground between vertex and
+edge locks; providing better concurrency than vertex locks and
+reducing overheads by managing a lock per edge. GTX does not use
+a high-overhead lock manager but a locking bit in the delta-chains
+index offsets as in Silo and TicToc [99, 108]’s version timestamps.
+Each delta-chains index entry uses its most significant bit as the
+locking bit. To lock a delta chain, 𝑡checks if the locking bit is set,
+and uses a 𝐶𝐴𝑆to set the bit atomically. Using locking bits in index
+offsets enables updating both the locking bit and the delta chain
+head atomically during commit as in Silo [99] and TicToc [108]
+that release locks while installing new timestamps. If the bit has
+
+=== PAGE 7 ===
+GTX: A Write-Optimized Latch-free Graph Data System with Transactional Support - Extended Version
+GTX Technical Report, 2025, arxiv
+already been set by other transactions, or the 𝐶𝐴𝑆fails, 𝑡detects
+a write-write conflict and aborts. Section 6.3 shows delta chain
+locking’s adaptivity to edge workload history.
+6.2
+Block Protection Protocol
+GTX supports different access permissions on edge-deltas blocks
+using a block state-based protection protocol inspired by [74]. GTX
+manages a global data structure 𝑏𝑙𝑜𝑐𝑘_𝑎𝑐𝑐𝑒𝑠𝑠_𝑡𝑎𝑏𝑙𝑒with one entry
+per worker thread. When a worker thread accesses an edge-deltas
+block, it calculates the block ID through the block’s source vertex ID
+and label, and stores it in its table entry. Each table entry is padded
+to take one cache line to avoid false sharing. GTX associates every
+edge-deltas block with an atomic state variable. GTX defines 5 states:
+𝑛𝑜𝑟𝑚𝑎𝑙, overflow, 𝑐𝑜𝑛𝑠𝑜𝑙𝑖𝑑𝑎𝑡𝑖𝑜𝑛, 𝑖𝑛𝑠𝑡𝑎𝑙𝑙𝑎𝑡𝑖𝑜𝑛, and 𝑑𝑒𝑙𝑒𝑡𝑒. 𝑛𝑜𝑟𝑚𝑎𝑙
+makes up the majority of an edge-deltas block lifetime where both
+reads and writes are allowed. All examples in Figure 3 assume blocks
+in State 𝑛𝑜𝑟𝑚𝑎𝑙. States overflow, 𝑐𝑜𝑛𝑠𝑜𝑙𝑖𝑑𝑎𝑡𝑖𝑜𝑛, and 𝑖𝑛𝑠𝑡𝑎𝑙𝑙𝑎𝑡𝑖𝑜𝑛
+are for edge-deltas block consolidation (Section 6.3). overflow and
+𝑖𝑛𝑠𝑡𝑎𝑙𝑙𝑎𝑡𝑖𝑜𝑛provide mutual exclusion on an edge-deltas block, and
+𝑐𝑜𝑛𝑠𝑜𝑙𝑖𝑑𝑎𝑡𝑖𝑜𝑛makes the block read-only. 𝑑𝑒𝑙𝑒𝑡𝑒is used for vertex
+delete, and prevents other transactions from accessing a block.
+The Block Protection protocol has 2 operations: register_access and
+change_state. When Transaction 𝑡accesses Edge-deltas Block 𝑏,
+𝑡calls register_access(b) to examine 𝑏’s state. If 𝑡’s operation is
+compatible with 𝑏’s state, 𝑡stores 𝑏’s ID in 𝑡’s 𝑏𝑙𝑜𝑐𝑘_𝑎𝑐𝑐𝑒𝑠𝑠_𝑡𝑎𝑏𝑙𝑒
+entry. Then, 𝑡rechecks 𝑏’s state. If it has not changed, 𝑡can proceed.
+If 𝑏’s state is incompatible with 𝑡’s operation, 𝑡unregisters its block
+access by storing 0 in the table, and retries later. Upon finishing, 𝑡
+unregisters its block access. A worker thread 𝑡ℎneeding to change
+𝑏’s state updates the state to the new value. If the new state is
+exclusive, 𝑡ℎscans the block_access_table. If 𝑡ℎfinds no threads
+accessing 𝑏, 𝑡ℎexecutes the operations in the new state. Else, 𝑡ℎ
+continues scanning the 𝑏𝑙𝑜𝑐𝑘_𝑎𝑐𝑐𝑒𝑠𝑠_𝑡𝑎𝑏𝑙𝑒until 𝑏is “safe".
+Similar functionalities can be achieved using shared-exclusive
+locks, but we argue that Block Protection Protocol is better-suited
+for GTX’s graph workloads. GTX already handles edge and vertex-
+level write-write conflicts using locking bits and 𝐶𝐴𝑆. Most of the
+time, an edge-deltas block is in 𝑛𝑜𝑟𝑚𝑎𝑙state, and a transaction 𝑡
+only needs to read the state variable, and to store the block ID in
+its block_access_table entry. 𝑡does not write to the shared memory
+variables to reduce cache invalidation across cores. Only during
+edge-deltas block consolidation and vertex deletion, 𝑡needs to
+modify shared state variables and scans the block_access_table but
+these are rare. We trade-off their extra costs for low overhead
+execution of the more common normal transaction operations.
+6.3
+Consolidation of an Edge-Deltas Block
+GTX preallocates storage in edge-deltas blocks to reduce edge delta
+allocation overhead and provide sequential adjacency list access as
+in [100, 111]. As edge deltas build up, edge-deltas blocks become full.
+GTX needs to allocate new blocks to accommodate new edge deltas
+and recycle memory of the invalidated deltas. GTX edge-deltas
+block consolidation analyzes edges, and allocates a new block to
+store the latest version and future edge deltas. GTX consolidation
+has 2 features: Reduce interference with concurrent transactions
+via the Block Protection Protocol, and adjust parallelism in the
+adjacency list to accommodate workloads using adaptive delta-
+chain locking. Refer to the example in Figure 4. Operations in each
+phase are in different colors. V20’s Edge-deltas Block 𝑏of Size 512
+bytes is full with a 64 byte header, 6 edge deltas (384 bytes) and
+64 bytes of property data with combined_offset=(64«32+384). Two
+ongoing transactions 𝑇1 and 𝑇2 have edge deltas in 𝑏. Transaction
+𝑡updates an edge and increments combined_offset to (64«32+448) to
+allocate a delta. 64 + 448 = 512 is greater than the total space, so 𝑡
+starts 𝑏’s consolidation. 𝑡changes 𝑏’s state to overflow, waits till no
+other transactions are accessing 𝑏, and restores combined_offset to
+(64«32+384). The corrupted overflow combined_offset cannot locate
+where edge deltas start. Resorting it in an exclusive state prevents
+concurrent transactions from accessing it. The atomic fetch_add
+ensures that only 1 transaction causes the overflow.
+Analysis: 𝑡changes the state to𝑐𝑜𝑛𝑠𝑜𝑙𝑖𝑑𝑎𝑡𝑖𝑜𝑛, and analyzes𝑏. Only
+edge updates are prohibited in this state. 𝑡scans 𝑏and finds latest
+version edge deltas: 𝑑(4,𝑈𝑃𝐷), 𝑑(5, 𝐼𝑁𝑆), and 𝑑(3, 𝐼𝑁𝑆). It also
+records 𝑑(5,𝑈𝑃𝐷) of 𝑇1 and 𝑑(4, 𝐷𝐸𝐿) of 𝑇2 as in-progress. 𝑡cal-
+culates a new block size using the workload history: latest version
+and in progress edge deltas. The new block needs at least 418 bytes:
+352 bytes to accommodate latest version and in progress deltas,
+and 64 bytes for the block header. Thus, 𝑡allocates a new block
+of size 1024 bytes; the smallest power of 2 that is at least 1.5x of
+418, and 4 delta chains. We design multiple different heuristics to
+control the adaptivity of edge-deltas blocks. One heuristic Simple
+calculates the smallest power of 2 of the minimum required delta
+storage (e.g., 512) here, and checks the new block’s fill ratio. If the
+ratio is large, e.g., larger than 75%, it will promote the block size to
+the next power of 2 (e.g., 1024) to avoid repetitive consolidations.
+Another heuristic LifeSpan calculates the ratio based on the distri-
+bution of creation and invalidation timestamps of all deltas in the
+edge-deltas block, and how long the block exists between its cre-
+ation time and the consolidation time. A long-living block indicates
+coldness, and requires a smaller ratio, e.g., 1×, and a short-living
+block indicates hotness and requires a larger ratio. In the experi-
+ments, it is found that Simple already suffices. We aim to develop
+more sophisticated models and functions to calculate the ratio for
+the LifeSpan heuristic in the future. Larger block sizes and more
+edge delta-chains can accommodate more edge deltas, and enable
+more concurrent updates. 𝑡allocates a new edge-deltas block 𝑏′ and
+updates its header: pointing 𝑏′’s previous pointer to 𝑏, and setting
+𝑏′’s creation timestamp to 10; the largest invalidation timestamp in
+the 𝑏. Transactions with 𝑟𝑡𝑠< 10 can access 𝑏. 𝑡also registers that
+𝑏can be safely recycled after Timestamp 10. 𝑡writes the 3 latest
+version edge deltas to 𝑏′, and updates the delta-chains index.
+Installation: After installing all latest version edge deltas,𝑡changes
+the block state to 𝑖𝑛𝑠𝑡𝑎𝑙𝑙𝑎𝑡𝑖𝑜𝑛to synchronize transactions. GTX
+handles concurrency at delta chain level that may change after a
+consolidation. To avoid inconsistencies in delta chains after con-
+solidation, 𝑖𝑛𝑠𝑡𝑎𝑙𝑙𝑎𝑡𝑖𝑜𝑛synchronizes committing transactions be-
+fore swapping the edge-deltas blocks. 𝑡updates delta-chains in-
+dex entries to “install" its edge deltas during commit (Section 5.2).
+𝑖𝑛𝑠𝑡𝑎𝑙𝑙𝑎𝑡𝑖𝑜𝑛requires all transactions that have already “installed"
+their edge deltas in 𝑏to commit or abort before 𝑏continues con-
+solidation, while committing transactions cannot install their edge
+deltas if 𝑏already has reached 𝑖𝑛𝑠𝑡𝑎𝑙𝑙𝑎𝑡𝑖𝑜𝑛. 𝑡knows which delta
+chains and transactions to check based on the previous analysis.
+
+=== PAGE 8 ===
+GTX Technical Report, 2025, arxiv
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+Figure 4: Consolidation Example
+Figure 5: Thread 5’s Transaction Table Partition
+Assume that 𝑇2 has installed its edge delta but later aborts and
+𝑇1 is still running. 𝑡waits till seeing 𝑇2’s final status(abort), and
+only writes 𝑑(5,𝑈𝑃𝐷) to 𝑏′. If 𝑇2 were to commit, 𝑡would also
+write 𝑑(4, 𝐷𝐸𝐿) to 𝑏′, and update the delta-chains index to point to
+𝑑(4, 𝐷𝐸𝐿). After installing all in-progress edge deltas, 𝑡increases
+the block version number, swaps𝑏𝑙𝑜𝑐𝑘_𝑝𝑡𝑟and index, and switches
+the block state back to 𝑛𝑜𝑟𝑚𝑎𝑙. It allows other transactions, e.g.,
+𝑇1, to access the block. Later, 𝑇1 commits and updates its edge
+delta at 𝑐𝑡𝑠= 18. Using the Block Protection Protocol ensures little
+overhead when the block is not overflowing, and improves concur-
+rency during consolidation. Block consolidation adjusts block size
+and concurrency level to adapt to the workload: Hot(cold) blocks
+allocate more(less) memory and provide more(less) concurrency.
+6.4
+Lazy Update
+GTX uses Lazy Update to reduce latency of transaction commits,
+and enforce SI [26, 107]. It distributes a transaction table to store
+transaction status: Each thread maintains its own transaction table,
+and can access other transaction tables based on thread IDs. We use
+the most significant 8 bits in transaction IDs to store worker thread
+information. Each transaction ID also has the most significant bit set
+to distinguish them from timestamps as discussed below. When a
+worker thread starts a new transaction, it calculates the transaction
+ID from its thread ID and a local counter, and stores the transaction
+entry in its transaction table. Each worker thread maintains every
+transaction 𝑡’s 𝑠𝑡𝑎𝑡𝑢𝑠and 𝑜𝑝_𝑐𝑜𝑢𝑛𝑡in its transaction table. 𝑠𝑡𝑎𝑡𝑢𝑠
+records 𝑡’s current state: 𝐼𝑛_𝑃𝑟𝑜𝑔𝑟𝑒𝑠𝑠, 𝐴𝑏𝑜𝑟𝑡that are predefined
+64-bit integers or a positive commit timestamp. 𝑜𝑝_𝑐𝑜𝑢𝑛𝑡records
+the number of deltas created by 𝑡. 𝑡has 𝑠𝑡𝑎𝑡𝑢𝑠= 𝐼𝑛_𝑃𝑟𝑜𝑔𝑟𝑒𝑠𝑠and
+𝑜𝑝_𝑐𝑜𝑢𝑛𝑡= 0 at creation time, and increments the 𝑜𝑝_𝑐𝑜𝑢𝑛𝑡as it
+creates more deltas. If𝑡aborts, its𝑠𝑡𝑎𝑡𝑢𝑠is set to 𝐴𝑏𝑜𝑟𝑡. If𝑡commits,
+its 𝑠𝑡𝑎𝑡𝑢𝑠stores its commit timestamp. Figure 5 gives an example of
+Thread 5’s transaction table. Thread 5 has created 17 transactions
+and the table contains its 15-17𝑡ℎtransactions’ information.
+At runtime, a transaction 𝑡may access an edge-deltas block or
+vertex delta but encounters another transaction 𝑞’s in-progress
+(edge) delta with 𝑐𝑡𝑠= 𝑞. 𝑡examines 𝑞’s status via 𝑞’s ID, and up-
+dates the delta’s 𝑐𝑡𝑠(and previous version’s 𝑖𝑡𝑠) to 𝑞’s 𝑤𝑡𝑠if 𝑞has
+committed. Then, 𝑡decrements 𝑞’s 𝑜𝑝_𝑐𝑜𝑢𝑛𝑡entry. Each transac-
+tion table is a circular array, and its entries can be reused if𝑜𝑝_𝑐𝑜𝑢𝑛𝑡
+equals 0. It enables 𝑂(1) lookup of transaction status using trans-
+action ID. Similar approaches for managing delta commit, abort,
+and visibility by cooperative threads are used in CTR’s fast recov-
+ery [22], Hekaton’s cooperative resource management [42], and
+Hint Bits for reduced visibility check overheads [4, 88]. GTX uses
+Lazy Update for a new purpose, namely, high throughput and low
+latency transaction commit.
+6.5
+Hybrid Transaction Commit and Abort
+GTX designs a high throughput low latency commit protocol for
+its read-write transactions inspired by Constant Time Recovery
+(CTR)’s fast recovery using a global table [22]. GTX’s hybrid group-
+commit protocol combines Lazy Updates and group commits to sup-
+port fast transaction commit while maintaining SI correctness [26,
+107]. GTX has a commit manager thread that manages a global
+commit array, where each worker thread has an entry to register
+its committing transaction. A committing transaction 𝑡starts with
+a preparation phase: 𝑡makes its edge deltas the heads of their cor-
+responding edge delta-chains, and unlocks them by updating the
+associated delta-chains index entries (Sections 5.2, 6.1). Section 6.3
+introduces consolidation that may modify delta chains storage.
+Thus, during the preparation phase, 𝑡must register block access
+using the Block Protection Protocol, and checks block version. 𝑡is
+only allowed to install its edge deltas in 𝑛𝑜𝑟𝑚𝑎𝑙and 𝑐𝑜𝑛𝑠𝑜𝑙𝑖𝑑𝑎𝑡𝑖𝑜𝑛
+states. For other states, 𝑡has to wait and retry. If the block version
+has changed since 𝑡wrote its last delta, 𝑡has to “relock" all delta
+chains its edge deltas belong to. Only after locking all needed delta
+chains, 𝑡can install its edge deltas. Otherwise, 𝑡aborts. 𝑡executes
+commit preparation in a vertex ID order to avoid deadlocks. Af-
+ter 𝑡’s preparation phase, future transactions can lock these delta
+chains, and lookup 𝑡’s edge deltas using the delta-chains index.
+These operations are not needed for vertex deltas. Then, 𝑡puts
+a pointer to its transaction table entry in its commit array entry.
+The commit manager adds 1 to 𝑔𝑤𝑒as the group commit times-
+tamp (𝑤𝑡𝑠), and scans the commit array. For each transaction, say
+𝑡, in the array, the commit manager writes 𝑤𝑡𝑠as 𝑡’s status in the
+transaction table entry. After scanning the whole array, the commit
+manager fetch_adds 𝑔𝑟𝑒by 1, atomically committing all trans-
+actions in this commit group at 𝑤𝑡𝑠. After being assigned a 𝑤𝑡𝑠, 𝑡
+eagerly updates its deltas’ timestamps while the concurrently exe-
+cuting transactions can Lazy Update them, making up the hybrid
+commit protocol. Correctness-wise, transactions starting after the
+
+=== PAGE 9 ===
+GTX: A Write-Optimized Latch-free Graph Data System with Transactional Support - Extended Version
+GTX Technical Report, 2025, arxiv
+incremented 𝑔𝑟𝑒are guaranteed to see deltas of the commit group.
+Performance-wise, it allows a group of transactions to commit with-
+out updating all their deltas, and the new 𝑔𝑟𝑒to start immediately.
+It reduces group commit latency and allows the commit manager to
+work on the next commit group without waiting for the previous
+group to commit all its deltas. It reduces potential stalls of the new
+commit group caused by transactions with large write sets, and
+allows concurrent transactions to cooperate and parallelize these
+transactions’ delta commits. It also decreases the synchronization
+between the commit manager and the commit group.
+Transaction Abort: An aborting read-write transaction 𝑡writes
+𝐴𝑏𝑜𝑟𝑡to its transaction table entry. Then,𝑡iterates over its modified
+edge-deltas blocks, aborts all of 𝑡’s deltas by writing 𝐴𝑏𝑜𝑟𝑡to their
+creation timestamps, and unsets any lock bits in the delta chains. 𝑡
+aborts all its vertex deltas by removing them from the delta chains.
+6.6
+State-aware Transaction Operations
+Edge Operations. Transactions use the Block Protection Proto-
+col for edge operations: states 𝑛𝑜𝑟𝑚𝑎𝑙and 𝑐𝑜𝑛𝑠𝑜𝑙𝑖𝑑𝑎𝑡𝑖𝑜𝑛for reads,
+and 𝑛𝑜𝑟𝑚𝑎𝑙for writes. To accommodate block version change af-
+ter consolidation, readers compare their 𝑟𝑡𝑠with blocks’ creation
+timestamp, and may need to use previous pointer to read an earlier
+edge-deltas block. Writers relock delta chains as in the commit
+preparation phase (Section 6.5) if they have edge deltas in the block
+with changed version and will abort if the relocking fails.
+Vertex Delete. Block Protection Protocol has a an exclusive state
+𝑑𝑒𝑙𝑒𝑡𝑒for deep cascading vertex deletes at high priority. For ex-
+ample, when deleting V20 (Section 5.5), 𝑡𝑑sets each of V20’s edge-
+deltas block’s state to 𝑑𝑒𝑙𝑒𝑡𝑒to delete the whole adjacency list.
+Concurrent transactions will abort if they see 𝑑𝑒𝑙𝑒𝑡𝑒on an edge-
+deltas block. After deleting all V20’s edges in neighbors’ edge-deltas
+blocks, 𝑡𝑑follows the same hybrid commit protocol. One difference
+is that 𝑡𝑑never aborts, and waits to lock delta chains to delete
+reverse edges of V20. After 𝑡𝑑has committed, it registers V20’s
+vertex delta and all its edge-deltas blocks safe to be recycled after
+𝑡𝑑’s commit timestamp (more details in Section 9). GTX assigns
+vertex delete highest priority to satisfy privacy laws like European
+Union’s General Data Protection Regulation that requires timely
+deletion of user data [83, 92, 98].
+7
+Durability and Recovery
+7.1
+Group Redo Logging
+Since both GTX and LiveGraph [111] use group commit, we extend
+GTX’s commit protocol by redo logging that is similar to that of
+LiveGraph. Each transaction maintains a redo logging buffer in its
+transaction table entry, recording newly created vertex and edge
+versions. After the commit manager scans the commit array and
+determines the commit group, it groups all individual transactions’
+commit logs into blocks and writes them to disk. GTX only main-
+tains redo logging because there is no persistent store to be undone,
+similar to other main memory DBMSs [42, 79, 109]. It also adopts
+value logging as in Silor [109] to enable highly parallel recovery.
+We support both synchronous and asynchronous logging. GTX
+forces the group commit log to be persisted before committing
+the transaction group. Transactions can eagerly or Lazily update
+deltas but those deltas would not be visible to new transactions
+until the commit manager persists the log and updates the 𝑔𝑟𝑒. It
+ensures full durability but limits performance. GTX also supports
+asynchronous logging [79]. It allows transactions to commit, and
+a new commit group to start while their logs are still buffered in
+memory (later written to disk in larger blocks). It has less influ-
+ence on the normal transaction throughput at the risk of losing
+committed transaction updates. Our experiments show 20% and
+12% throughput degradation for synchronous and asynchronous
+logging, respectively.
+7.2
+Incremental Fuzzy Checkpointing
+Inspired by the main-memory systems Hekaton [42] and Silor [109],
+we design a delta-based fuzzy checkpoint protocol that is collab-
+orative, parallel, and incremental. GTX manages a global check-
+point object that is accessible to all worker threads. It contains the
+timestamps the current and last checkpoints begin (𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑡𝑠and
+𝑙𝑎𝑠𝑡_𝑡𝑠), the maximum vertex ID 𝑚𝑎𝑥_𝑣𝑖𝑑when this checkpoint
+begins, and the current checkpoint progress 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑣𝑖𝑑. After 𝑥
+transaction operations, Worker Thread 𝑡enters the checkpoint
+phase. If the checkpoint is “uninitialized", 𝑡initializes it by up-
+dating atomic flags. It stores GTX’s maximum vertex ID, and 𝑔𝑟𝑒
+in the checkpoint’s 𝑚𝑎𝑥_𝑣𝑖𝑑and 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑡𝑠, and creates a new
+checkpoint directory at a system-designated location for all check-
+points. Each checkpoint directory stores the 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑡𝑠in its name
+to maintain a chronological order of checkpoints. Each worker
+thread appends to a separate checkpoint file within this directory.
+After initialization, or if the checkpoint is already initialized, 𝑡per-
+forms one round of cooperative checkpointing. 𝑡𝑓𝑒𝑡𝑐ℎ_𝑎𝑑𝑑𝑠the
+𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑣𝑖𝑑by a number 𝑧. Assuming the return value is 𝑘, 𝑡check-
+points Vertices 𝑘to 𝑘+ 𝑧−1. For each vertex, say 𝑣, 𝑡reads 𝑣’s
+latest version vertex and edge deltas from the vertex delta chain and
+edge-deltas blocks. All latest version deltas with 𝑐𝑡𝑠> 𝑙𝑎𝑠𝑡_𝑡𝑠
+will be written to 𝑡’s checkpoint file sequentially. Also, 𝑡records
+each edge-deltas block size to enable appropriate allocation during
+recovery. After 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑣𝑖𝑑> 𝑚𝑎𝑥_𝑣𝑖𝑑, the current checkpoint fin-
+ishes. The last worker thread to finish its local checkpoint updates
+the system metadata to mark the new checkpoint directory as the
+latest checkpoint. GTX’s checkpoint is fuzzy. It does not guarantee
+a transaction-consistent state: a transaction started after 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑡𝑠
+may only have parts of its updates persisted in the snapshot. We
+choose this design for the same reasons as those for Silor [109]. We
+do not want the system to force a snapshot on checkpoint which
+may delay garbage collection and incur extra memory allocation
+cost. Also GTX has to replay redo logs starting from 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑡𝑠,
+so there is no need to enforce a transaction-consistent snapshot.
+GTX checkpoint is incremental. A new checkpoint stores only the
+latest version changes since the last checkpoint. GTX checkpoint
+files are append- and then read-only. When the checkpoints reach
+a threshold, an LSM-tree-styled merging will merge the disk files
+into a single checkpoint. Our experiments show an additional 5-10%
+throughput degradation depending on the checkpoint frequency
+than only using the redo log while reduces the log size by up to
+95%.
+
+=== PAGE 10 ===
+GTX Technical Report, 2025, arxiv
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+7.3
+Parallel Recovery
+We propose a parallel recovery technique similar to those of Silor
+and Hekaton [42, 109] using value logging and multiple checkpoint
+files to have high parallelism in recovery. Within each checkpoint di-
+rectory, each checkpoint file stores a disjoint set of vertices and their
+edges. GTX recovery starts with the latest checkpoint directory.
+Each worker thread loads its own checkpoint file in the directory,
+and writes the latest version edges and vertices into GTX. This step
+has little interference among threads because each checkpoint file
+stores a disjoint set of vertices and edges. After finishing one check-
+point, worker threads move on to the previous checkpoint until all
+checkpoints are processed. Then, worker threads replay the logs
+from the log tail until the latest checkpoint’s timestamp. Worker
+threads replay operations in parallel as in normal edge and vertex
+updates but create deltas with actual creation timestamps instead of
+transaction IDs. Notice that for every vertex or edge in a checkpoint
+and redo logging, reconstruction starts with locating the previous
+version delta. The replay takes place only if the operation’s create
+timestamp is larger than the latest version delta’s.
+8
+Serializable Transactions
+Serializable read-write transactions are implemented using read set
+validation [42, 75, 99]. While GTX’s SI only requires transactions
+to read a consistent snapshot, Serializability in GTX requires a
+transaction’s reads and writes to logically happen at the same time
+(its read-set stays unmodified during transaction execution) [42]. In
+𝑀𝑉𝐶𝐶systems, read-only transactions acquire a read timestamp
+(𝑟𝑡𝑠) at create time, and sees all versions with overlapping lifespan.
+These read-only transactions can always be put in a serial order
+according to their 𝑟𝑡𝑠. Thus, our focus is on read-write transactions
+with both reads and writes on the graph.
+Each read-write transaction, say 𝑡, locally keeps a read set 𝑅,
+scan set 𝑆, and a write set 𝑊. 𝑡stores all vertices and edges it reads
+in 𝑅, and all adjacency lists it scans in 𝑆. 𝑡records each of its writes
+in 𝑊. When 𝑡searches an edge delta-chain or scans an edge-deltas
+block, 𝑡checks whether the edge delta-chain or edge-deltas block
+contains a delta with larger 𝑐𝑡𝑠than 𝑡’s 𝑟𝑡𝑠. If this is the case, 𝑡can
+abort early because 𝑡’s writes will break serializability. When 𝑡is
+committing, besides the preparation phase to install edge deltas
+(Section 6.5), 𝑡has to validate each vertex/edge in its read set, and
+edge-deltas block in its scan set. 𝑡groups edges in its read set and
+edge-deltas block in its scan set based on vertex IDs and labels, and
+validates them in this order. It further groups edges in the same
+edge delta-chain together. For 𝑣,𝑒∈𝑅, 𝑡checks the vertex or edge
+delta-chain head’s 𝑐𝑡𝑠. If 𝑐𝑡𝑠> 𝑡.𝑟𝑡𝑠, 𝑡aborts because its read set has
+already been updated. For 𝑡’s scan set, 𝑡has to validate that the edge-
+deltas block (adjacency list) does not have new edge deltas created
+after 𝑡’s 𝑟𝑡𝑠. Otherwise, 𝑡aborts. After 𝑡validates its read and scan
+sets, it can move forward to commit. We revise the commit phase
+with additional synchronizations. Each transaction must register in
+the commit group to start its validation phase. After the validation
+phase, the transaction fetches the global write epoch, and uses it as
+its commit timestamp. To accommodate the validation phase, the
+commit manager tracks the current commit group, and enforces a
+serialization point between groups. It periodically enters a quiescent
+state and waits for all transactions in the current commit group to
+validate, then commit or abort. It starts a new commit group by
+incrementing global read/write epochs. Future transactions must
+wait to commit after the quiescent state. Note that if 𝑡has an empty
+write set or it contains empty read and scan sets, it is considered a
+read-only or a write-only transaction, and does not participate in
+read set validation.
+Discussion: There are some implications that follow from design-
+ing serializable transactions. If a transaction 𝑡2 is placed after trans-
+action 𝑡1 in the serial order according to the commit timestamp, 𝑡2
+should see all 𝑡1’s committed updates. Therefore, 𝑡2 has to ensure
+that it does not miss any updates. If 𝑡2 repeatedly fails the validation
+when it reads a hotspot edge-deltas block, a lock-based protocol is
+preferred to ensure progress. On the other hand, using a read-write
+transaction to perform both graph analytics and updates will signif-
+icantly degrades performance. Because graph analytics algorithms
+typically scan the whole graph, a single update will break the seri-
+alizability for this transaction if it also has writes. Therefore, it is
+better to use a read-only transaction for graph analytics. If there is
+a need to run a transaction with both graph analytics and updates,
+it is better to reduce the isolation level to Snapshot Isolation instead.
+9
+Resource Management
+Memory Allocation. GTX adopts the hybrid memory allocator
+from LiveGraph [111] to balance concurrent memory allocation and
+space utilization. It allocates a large chunk of memory at system
+start via 𝑚𝑚𝑎𝑝, and divides memory into blocks of varying powers-
+of-2 sizes (as in Buddy systems [63]). Each worker thread locally
+manages a pool of memory blocks smaller than a threshold and can
+allocate memory blocks from this pool without synchronization.
+Larger memory blocks are managed in a global pool. Due to the
+power-law nature of real-world graphs, most vertices are not hub
+vertices, i.e., do not have many edges. Thus, most of the vertex
+delta and edge-deltas block can be directly allocated from threads’
+private pools. Even when threads need to allocate a larger block,
+they unlikely request it at the same time. Thus, GTX’s memory
+allocation protocol is mostly contention-free.
+Cooperative Garbage Collection. 𝑀𝑉𝐶𝐶creates garbage: ver-
+sions that no current and future transactions can see. State-of-the-
+art 𝑀𝑉𝐶𝐶/snapshot systems support garbage collections (GC) [22,
+39, 42, 52, 67, 75, 95, 99, 111]. Cooperative garbage collection is used
+extensively in both relational and graph systems due to its good per-
+formance in coupling with normal transaction operations [42, 52, 67,
+75, 99, 111]. It saves the overhead of maintaining additional garbage
+collection threads, and provides timely recycling of garbage. GTX
+maintains a timestamp table (one entry per worker thread) to store
+the timestamps of running transactions. Worker threads register
+memory blocks as garbage during runtime, and periodically recycle
+the “safe" blocks. When a transaction commits or Lazy Updates a
+vertex delta, it invalidates the vertex’s previous version. A worker
+thread invalidates the (old) edge-deltas block after consolidating
+it. Each worker thread, say 𝑤, maintains a local priority queue to
+store the invalidated vertex delta or edge-deltas blocks with their
+invalidation times. Periodically, 𝑤scans the timestamp table to find
+the “safe" (minimum) timestamp. 𝑤continuously recycles mem-
+ory blocks from its garbage queue until the queue is empty or the
+
+=== PAGE 11 ===
+GTX: A Write-Optimized Latch-free Graph Data System with Transactional Support - Extended Version
+GTX Technical Report, 2025, arxiv
+Systems
+Atomicity
+Consistency
+Isolation
+Durability
+single operation
+multiple operations
+no dangling edge
+no duplicate edge
+SI
+Serializable
+log+checkpoint
+GTX
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+LiveGraph
+✓
+✓
+✓
+✓
+✓
+✗
+✓
+Teseo
+✓
+✓
+✓
+✓
+✓
+✗
+✗
+Sortledton
+✓
+✓
+✓
+✓
+✗
+✓
+✗
+Spruce
+✓
+✗
+✗
+✓
+✗
+✗
+✗
+Table 1: Transactional Graph System Comparison
+Graph Dataset
+|V|
+|E|
+Avg. Degree
+Max Degree
+dota-league
+61K
+51M
+1663.24
+17004
+graph500-24
+9M
+260M
+58.7
+406416
+uniform-24
+9M
+260M
+58.7
+103
+yahoo-songs
+1.6M
+256M
+513.04
+468425
+edit-wiki
+50M
+572M
+22.561
+5576228
+graph500-26
+33M
+1B
+64.13
+1003338
+twitter
+41M
+1.46B
+70.506
+3081112
+Table 2: Dataset Statistics
+current queue head’s timestamp becomes too large. If a recycled
+block 𝑏is small, 𝑤stores 𝑏in its local pool, else 𝑏is sent back to
+the global pool [111]. This ensures that small blocks are allocated
+contention-free while large blocks return to the global pool for
+reuse by all threads. Silo [99], Hekaton [42], and Cicada [75] also
+register garbage, and perform cooperative safe timestamps-based
+garbage collection. GTX’s GC is unique in its low overhead design.
+GTX recycles each outdated edge-deltas block as a whole instead of
+each invalidated edge delta individually, reducing garbage registra-
+tion and recycling overhead. Each garbage registration is included
+in the normal operations: commit, Lazy Update or block consolida-
+tion. Thus, worker threads do not search for garbage. GTX worker
+threads have little interference when recycling garbage blocks. Each
+garbage priority queue is managed locally, and the timestamp table
+is cache-friendly and latch-free. GTX GC ensures that the safe mem-
+ory block is inaccessible by other threads. Thus, there is no need
+for thread synchronization during GC. In contrast, state-of-the-art
+GCs generally execute at per-object granularity [75, 99], or interact
+with other threads through locks or atomic primitives [42, 75].
+Figure 6: Bars Color Code in Experimental Results.
+10
+Evaluation
+This study focuses on supporting high throughput read-write trans-
+actions with concurrent graph analytics. Experiment Setup. Ex-
+periments run on a dual-socket machine with Intel(R) Xeon(R)
+Platinum 8368 @ 2.40GHz processors. It has 2 NUMA nodes and
+each NUMA node’s CPU has 38 physical cores supporting up to
+76 threads. We compile all systems with GCC 13.3.0 and O3 opti-
+mization flag, and evaluate them over a single NUMA node with
+best effort, i.e., the evaluated system allocates memory locally, and
+uses remote memory only if its memory exceeds a single NUMA
+node. We conduct experiments with up to 64 worker threads. We
+choose to allocate fewer worker threads than one NUMA node’s
+available threads to avoid causing computing resource contentions
+and induced inaccuracies and allow systems, e.g., Teseo [39] to
+spawn service threads. One exception is for insert experiments of
+graph500-26 [12] and twitter [65] with over 1 billion edges. This
+machine’s memory is not enough to evaluate all the systems. Thus,
+for these datasets, we evaluate all systems in a setup with Intel(R)
+Xeon(R) Platinum 8168 CPU @ 2.70GHz processors that has 12
+cores supporting up to 24 threads and 387GB DRAM per NUMA
+node. To minimize NUMA effects, we run the experiments in a
+single NUMA node with up to 20 worker threads to avoid com-
+puting resource contention. Statistics of all graph datasets used in
+the experiments are given in Table 2. We use the same evaluation
+program based on the 𝐿𝐷𝐵𝐶Graphalytics benchmark [20, 59] used
+in Teseo [39], Sortledton [52], and Spruce [95], and add more ex-
+periments. We evaluate against the transactional graph systems:
+LiveGraph [111], Teseo [39], and Sortledton [52]. Our evaluation
+focuses on SI isolation level, and we mainly evaluate the SI version
+of GTX. Note that LiveGraph and Teseo only support SI. In Sec-
+tion 10.5, we use an additional experiment to compare the SI and
+Serializable versions of GTX. Spruce [19, 95] lacks enough transac-
+tional support for the experiments. Its transactions can only update
+a single directed edge, or read a single vertex’s neighborhood. To
+insert an undirected edge, Spruce creates 2 transactions (with two
+timestamps), breaking reciprocal consistency [35, 102]. Also, it cre-
+ates 1 transaction per adjacency list scan, thus, failing to obtain a
+transaction consistent view of the whole graph. Thus, we exclude
+this system from the experiments. Table 1 compares these systems.
+Note that Sortledton requires transactions to know their read and
+write sets beforehand [52]. Experiments include a few instances of
+uniform graphs but the main focus is on power-law graphs as many
+real-world graphs exhibit such patterns [33, 34, 46, 96]. Experiment
+results follow the color codes in Figure 6.
+10.1
+Insert Performance
+This experiment includes inserting uniform and power-law real-
+world and synthetic graphs with edges shuffled or according to
+timestamp order. Each system inserts an undirected edge by in-
+serting 2 directed edges in a transaction and executes “checked"
+operations so that every edge insert involves a read to check if
+the edge exists. Thus, each transaction internally executes 2 edge
+lookups and 2 edge writes atomically. Thus, having efficient edge
+reads can improve transaction throughput.
+
+=== PAGE 12 ===
+GTX Technical Report, 2025, arxiv
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+Figure 7: Insertion Throughput
+Figure 8: Update Throughput
+Random-order Inserts. Evaluated systems insert edges from uni-
+form and power-law real-world and synthetic graphs: graph500-24,
+26, uniform-24, dota-league [12, 68] and twitter [65]. graph500-26
+and twitter have over 1 billion edges. Thus, we evaluate them on
+the machine with larger DRAM up to 20 worker threads. We have
+evaluated other graph datasets but their results are similar to the
+ones presented, and are omitted for brevity. The results are in Fig-
+ure 7. GTX has over 10x better throughput than LiveGraph and
+1.34x to 2x better throughput than the second-best Sortledton.
+Timestamp-ordered Inserts. We insert edges of real-world graphs
+yahoo-songs and edit-wiki [65] based on their creation timestamps.
+Real-life power-law graphs not only have hub vertices (dataset edit-
+wiki has vertices with millions of adjacent edges) but also hotspots.
+Transactional graph systems have significant performance degra-
+dation when inserting edges in timestamp order [52]. Thus, we
+compare performances in both random and timestamp order in-
+sertions. Refer to Figures 7’s yahoo and edit-wiki. As baseline, we
+evaluate inserting edges in random order. For yahoo-songs, GTX
+has the best scalability with up to 70% better throughput over Sor-
+tledton. For edit-wiki, GTX ranks the second and performs the best
+with medium parallelism degree. GTX does not scale well here
+at high worker thread numbers because its adaptive delta chains
+adjustment heuristic does not catch up well with large neighbor-
+hoods. GTX could have used a more aggressive heuristic to allocate
+larger edge-deltas block and increase delta chain numbers during
+consolidation, so more concurrent writers would be allowed per
+edge-deltas block. However, this will increase the size of allocated
+blocks and memory used by indexes, and may incur wasted spaces
+for low-degree vertices. We plan to explore more sophisticated
+heuristics in future works. In contrast, when inserting in the times-
+tamp order, GTX performs the best over all competitor systems.
+The second-best Sortledton’s throughput suffers up to 90% degra-
+dation. In contrast, GTX’s throughput only drops by up to 30%. In
+yahoo-songs, GTX has up to 11x better throughput than Sortledton
+and in edit-wiki, GTX has up to 9x better throughput.
+Performance Analysis. Experiment results show that GTX has
+the highest throughput in power-law graph updates and only GTX
+can maintain high performance under edge update hotspot and tem-
+poral localities. We attribute GTX’s performance to its non-blocking
+latch-free graph store and low-overhead and adaptive delta-chain
+locking. GTX’s exclusive locks are embedded in the delta-chains
+index with minimal overhead. GTX adjusts the number of delta
+chains of each edge-deltas block as edge updates arrive, and en-
+ables concurrent writes to the same vertex. Thus GTX achieves the
+highest performance in timestamp-ordered workload. For uniform
+graphs, Sortledton outperforms GTX for low parallelism degrees,
+but GTX’s performance catches up as the number of concurrent
+worker threads increases. Since the graph is uniform, each vertex
+has about the same number of edges. Concurrent transactions are
+not likely updating the same adjacency lists. Thus, GTX’s delta-
+chain locking becomes under-utilized, and the drawbacks of vertex-
+centric locking are mitigated because transactions are less likely
+to conflict in this case. However, for power-law graphs, Sortled-
+ton’s threads block on concurrent updates on hub vertices and
+during a hotspot causing performance degradation. Ideally, Teseo
+should reduce the conflict in concurrently updating hub vertices
+by storing large neighborhoods in multiple segments. However,
+its sparse array segment rebalance exclusively locks multiple ad-
+jacent segments. Thus, concurrent rebalance threads may conflict
+when locking the same adjacent segment or with other concurrent
+transactions. Teseo’s segment locking may also incur false positives
+
+=== PAGE 13 ===
+GTX: A Write-Optimized Latch-free Graph Data System with Transactional Support - Extended Version
+GTX Technical Report, 2025, arxiv
+Figure 9: Concurrent Updates and Analytics: Transaction Throughput
+Figure 10: Concurrent Updates and Analytics: Graph Analytics Latency
+by locking vertices in the same segment. Thus, its throughput in
+timestamp-ordered experiment degrades by up to 99%. LiveGraph’s
+performance suffers due to vertex-centric locking and the absence
+of edge indexes. For each edge insert, a LiveGraph transaction scans
+the edge block to check if the edge exists which is costly.
+Lessons learned: Using latch-free techniques and low-overhead
+locking bits, having edge indexes, and breaking down vertex-centric
+locking to adapt workload enable higher transaction throughput.
+10.2
+Update Performance
+We adopt the graph500-24 update experiments from Teseo [39]
+and Sortledton [52] to evaluate the performance of transactional
+graph systems in handling graph updates, but we add additional
+datasets. We generate log files based on the edges of the power-
+law graph graph500-24 using graphlog [37]. The source graph has
+around 260M edges with 2.6B edge-update logs. The 1st 10% edge
+logs are edge inserts that build the original graph. The next 90%
+are edge inserts and deletes. If a vertex has high degree in the
+graph, it has proportionally more edge update logs. The experiment
+ensures that graph size stays close to the initial size. All systems
+execute checked operations: Edge inserts (deletes) only happen
+after checking the edge existence. Each system uses one NUMA
+node. If memory is not enough, it uses a remote node. LiveGraph’s
+memory use is overly large, and could only process 20% of the
+logs. Thus, its experiments are conducted using 20% of the logs.
+We generate one set of edge update logs, and place the edge logs
+randomly in the edge log stream. Also, we generate another set of
+edge logs with temporal localities and hotspots to mimic real-world
+scenarios. Transactions will more likely update the same vertex’s
+adjacency list concurrently. We report the edge update transaction
+throughput in Figure 8.
+GTX maintains its highest throughput and scalability in update
+transactions due to reasons similar to those discussed in the Inser-
+tion Experiments. Moreover, LiveGraph and Sortledton experience
+performance degradation in workloads with temporal localities
+and hotspots. One interesting difference is Teseo that maintains
+high performance in both workloads, and becomes the second-
+best performing system behind GTX. Notice that Teseo does not
+experience the same severe performance degradation as that in
+timestamp-ordered insertion experiment. We attribute this to the
+in-place updates in Teseo. As discussed earlier, the graph size stays
+close to its initial size during the update experiments, and Teseo
+performs in-place updates for deletes and subsequent inserts. There-
+fore, Teseo does not incur as many structure modifications as in the
+insert-only experiments. Service threads are invoked less frequently,
+and they are less likely to lock sparse array segments, reducing
+contentions among concurrent threads.
+Lessons Learned: In-place updates reduce the frequency of struc-
+ture modifications that have coarser lock-granularity, and may
+induce contention. Thus, limiting the amount of structure modifi-
+cations in a graph system is beneficial for transaction throughput.
+10.3
+Concurrent Updates and Analytics
+We study how systems support concurrent update transactions and
+graph analytics simultaneously.
+The mixed-workload experiment works as follows: We allocate
+60 thread resources, and control the read/write ratio by assigning
+the threads either as write or OpenMP [16] read threads, e.g., 30
+write and 30 read threads form a 50% write workload. Write threads
+continuously run update transactions as in the Update Experiment
+using the same graph logs while read threads run graph analytics.
+We could not report the results of Teseo as it runs into deadlocks (the
+same problem is reported in Sortledton’s evaluation [52]). Sortled-
+ton has segmentation fault errors for some workloads, but we are
+still able to produce results. For analytics, we evaluate 1-hop (1-HN)
+and 2-hop neighbors (2-HN) that find 1-hop and 1-2 hop neighbors
+of a set of vertices, and breadth first search (BFS), PageRank (PR),
+and single source shortest paths (SSSP) from Graphalytics [20, 59].
+Similar experiments are in [52, 95] but they only run BFS and PR
+under certain thread configurations.
+
+=== PAGE 14 ===
+GTX Technical Report, 2025, arxiv
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+Figure 11: Concurrent Update with Hotspot and Temporal Localities and Analytics: Transaction Throughput
+Figure 12: Concurrent Update with Hotspot and Temporal Localities and Analytics: Graph Analytics Latency
+Normal Update Distribution. We use the same edge-update logs
+with random edge distribution as those in the Update Experiment.
+Write threads run transactions executing edge logs, and concurrent
+graph analytics start at 10% of the update workload (after the source
+graph is loaded). The results are in Figures 9, 10. Sortledton crashes
+for several workloads. We redo these workloads and record the
+results for the successful runs. For 1-HN, PR, and SSSP, when the
+workload is read-heavy, e.g., 30% write, GTX’s concurrent analytics
+can take at most 2× longer time than the best performing com-
+petitor. GTX has slightly higher transaction throughput than the
+second place Sortledton under these workloads. As the workload
+becomes more write-heavy, GTX’s graph analytics performance
+catches up, and has the highest transaction throughput. For write-
+heavy workloads, e.g., 90% write, GTX has 1.46× to 1.7× higher
+transaction throughput than the second best system Sortledton, and
+performs the best and second best in SSSP and PR, respectively. GTX
+also maintains competitive performance in 1-HN against the other
+systems. Sortledton wins in BFS with significantly lower latency
+under all workloads. GTX is 1.13× to 1.75× faster than Sortledton
+in 2-HN under all workloads while achieving better transaction
+throughput (1.05× to 1.51×). LiveGraph exhibits good performance
+for graph analytics (around 0.99× to 1.54× faster than GTX), but
+its transaction throughput is significantly lower than the other 2
+systems (GTX has 5.2× to 11.9× higher transaction throughput
+than LiveGraph).
+Temporal Locality and Hotspot Update Distribution. This ex-
+periment has the same setting as the previous mixed-workload
+experiment except for having different edge logs. We use the edge-
+update logs with temporal localities and hotspots from the Update
+Experiment. We study performance for concurrent reads and writes
+with temporal localities. Sortledton’s segmentation fault persists
+for this hotspots workload. Thus, we only report available results
+in Figures 11, 12. All systems’ graph analytics performance are not
+affected much by update hotspots. Sortledton and LiveGraph trans-
+actions degrade by up to 68.5% and 46% in throughput, respectively,
+for workloads with temporal localities and hotspots in update pat-
+terns. Only GTX maintains high transaction throughput (up to 5.3×
+and 22.3× better than Sortledton and LiveGraph, respectively) and
+is competitive in graph analytics.
+Performance Analysis. GTX has the best transaction throughput
+while maintaining competitive graph analytics performance across
+different workloads. We attribute this to the following reasons. GTX
+supports delta-based MVCC that prevents read transactions from
+conflicting with write transactions. Thus, the interference between
+concurrent updates and graph analytics is mitigated. GTX’s adap-
+tive delta-chain locking adapts to workload temporal localities and
+hotspots to provide higher concurrency than vertex-centric lock-
+ing systems. Thus, GTX can maintain high transaction throughput
+across all experiments. It stores and manages edge delta-chains
+of each adjacency list sequentially in a memory block. This pre-
+serves cache locality, reduces random memory access and cache
+misses, and facilitates prefetch. Previous works [39, 52, 111] show
+that sequential adjacency list storage is beneficial to adjacency list
+scan: the backbone for graph analytics. GTX implements graph
+algorithms (e.g., BFS, PR, and SSSP) directly accessing edge-deltas
+blocks, and is compiled within the system. It saves the cost of using
+adjacency list iterators and associated functional calls. Our experi-
+ments show that using an iterator is around 1.15× slower in graph
+analytics. Finally, GTX distributes the transaction table over worker
+threads to enable latch-free 𝑂(1) access to transaction status for
+Lazy Updates, and the Block Access Table allows each reader and
+writer thread to register block-level access in its own cache-line-
+aligned entry without invalidating caches of other worker threads
+or modifying a shared lock.
+Sortledton performs differently across experiments. It has the
+second best transaction throughput but it degrades for workloads
+with temporal localities and hotspots. For analytics, it performs
+the best in BFS. Sortledton uses exclusive lightweight latches for
+each adjacency list. BFS touches a smaller portion of the graph.
+
+=== PAGE 15 ===
+GTX: A Write-Optimized Latch-free Graph Data System with Transactional Support - Extended Version
+GTX Technical Report, 2025, arxiv
+Figure 13: Power-Law Graph Insertion Memory Usage
+Figure 14: Mixed-Workload Memory Consumption
+Thus, update and read transactions are less likely to conflict, by-
+passing the negative locking effects. BFS requires each vertex’s
+degree to initialize the algorithm. GTX and LiveGraph scan the
+vertex adjacency list to calculate this value. This dominates the
+BFS latency. Sortledton supports vertex degree versioning that al-
+lows transactions to get vertex degree efficiently, thus supporting
+efficient BFS. PR and SSSP require finding each vertex’s degree,
+but they also need to scan vertices’ adjacency lists multiple times.
+The algorithm’s execution phase dominates the total latency, and
+thus Sortledton’s advantages drop. As read threads scan the graph
+heavily, they become more likely to conflict with write transactions.
+1-HN and 2-HN only requires adjacency list scans. In 2-HN, each
+vertex’s 1-hop neighbors are not known a priori, causing Sortledton
+to have large locking overhead, and hence has worse performance
+than GTX. LiveGraph shows strong disparity between its transac-
+tion throughput and graph analytics. Its transaction throughput is
+several times worse than both GTX and Sortledton but its graph
+analytics perform better. LiveGraph uses a similar-styled 𝑀𝑉𝐶𝐶as
+GTX’s but only optimizes for sequential adjacency list scans [111].
+It guarantees that each vertex’s adjacency list is stored sequen-
+tially in memory and transaction reads and writes never conflict.
+Moreover, LiveGraph has smaller edge log entries compared to
+GTX’s edge deltas. The compact sequential adjacency list storage
+enables good read performance. But LiveGraph suffers from its
+simple vertex-centric locking and lack of edge lookup indexes as
+discussed in Section 10.1 and has the worst transaction throughput.
+Lessons learned: Limiting writes to shared memory variables, iso-
+lating updates in versions, and being cache-friendly reduce trans-
+action overheads and interference. Having a sequential adjacency
+list and limiting function calls enable performant graph analytics.
+10.4
+Memory Consumption
+GTX uses 64-byte edge deltas, so it uses more memory to load
+and store a graph. For power-law graph inserts, GTX uses around
+2× to 3×, 0.9× to 2.1×, and 1.2× to 1.9× more memory than Sor-
+tledton, Teseo and LiveGraph respectively (Figure 13). However,
+GTX’s memory usage stays stable and consistent in more complex
+workloads involving updates (invalidated versions), concurrent an-
+alytics, and hotspots. Figure 14 shows memory usage comparison
+of different systems under balanced mixed-workload experiments .
+It shows that GTX is efficient in memory allocation and garbage
+collection. LiveGraph uses more memory if the workload involves
+updates and analytics, while Sortledton’s memory usage increases
+at most 5.17× in workloads with temporal localities and hotspots.
+GTX has the lowest memory consumption for these experiments.
+Figure 15: Performance Degradation of Serializable GTX
+10.5
+Serializable vs. Snapshot Isolation GTX
+We modify the insertion experiment (Section 10.1) to evaluate Se-
+rializable GTX’s overhead over its Snapshot Isolation (SI) version
+using the same datasets and number of threads. Besides the checked
+edge insertion, each worker thread records the edge inserted in its
+last transaction. For each subsequent edge insert, the worker thread
+creates a new read-write transaction that first reads the previous
+edge inserted, and then inserts the checked edge. We report the
+average degradation using 4 of the datasets as in Figure 15. Serializ-
+able GTX has 3-25% throughput degradation vs. the SI version due
+
+=== PAGE 16 ===
+GTX Technical Report, 2025, arxiv
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+to the following factors. Committing transactions and the commit
+manager need to synchronize in the quiescent state to enforce seri-
+alization between commit groups. Moreover, transactions need to
+recheck objects they read and will abort if they break serializability.
+Lessons Learned: Serializable transaction support comes at a
+price of up to 25% performance degradation. LiveGraph [111] and
+Teseo [39] only support SI. Sortledton [52] supports serializabil-
+ity but requires known read and write sets and finishing all reads
+before writes. Because serializability support is costly and SI is
+sufficient for graph workloads (discussed in Section 6), serializable
+transactions should be used only when necessary.
+11
+Conclusions
+GTX is a latch-free write-optimized transactional graph system
+that supports concurrent read-write transactions and graph ana-
+lytics. It adopts an adjacency list format and a delta chain-based
+storage with delta-chains index. Its adjacency list design combines
+both the linked list-based delta store [70] and append-only delta
+updates [100, 111] to enable high update throughput, low-latency
+single edge lookup, and sequential adjacency list scan. GTX has high
+read and write concurrency using transactions, multi-versioning,
+and Lazy Update hybrid commit under snapshot isolation. Evalu-
+ation against state-of-the-art transactional graph systems shows
+that GTX has better performance for read-write transactions, and is
+several times better in handling real-world write workload with tem-
+poral localities. GTX performs well under mixed workloads when
+the workload is at least 50% writes, in which case, GTX has better
+read-write transaction throughput while its graph analytics latency
+remains competitive. For most of the write-heavy workloads, GTX
+significantly outperforms competitors in write throughput while
+maintaining close or even better graph analytics latency. Overall,
+GTX demonstrates that using latch-free techniques, avoiding vertex-
+centric locking, being cache-friendly, maintaining adjacency list-
+level edge indexes and sequential adjacency list storage, and being
+adaptive to the workload can enable high transaction throughput
+and better read-write concurrency in transactional graph systems.
+References
+[1] [n. d.]. . https://graphbase.ai/
+[2] [n. d.]. RedisGraph. https://redis.io/docs/latest/operate/oss_and_stack/stack-
+with-enterprise/deprecated-features/graph/
+[3] 2013.
+New Tweets per second record, and how!
+https://blog.twitter.com/
+engineering/en_us/a/2013/new-tweets-per-second-record-and-how
+[4] 2015. Hint Bits. https://wiki.postgresql.org/wiki/Hint_Bits
+[5] 2019. China’s Singles’ Day shopping spree sees robust sales. http://www.xinhuanet.
+com/english/2019-11/11/c_138546429.htm
+[6] 2020. OrientDB. https://orientdb.org/
+[7] 2022.
+LDBC benchmark data sets.
+https://ldbcouncil.org/data-sets-surf-
+repository/snb-interactive-v2-updates.html
+[8] 2023. ByteDance. https://www.bytedance.com/en/
+[9] 2024.
+Concurrent Data Access.
+https://neo4j.com/docs/operations-
+manual/current/database-internals/concurrent-data-access/#transactions-
+isolation-lostupdates
+[10] 2024. Get Started with SAP HANA Graph. https://developers.sap.com/group.
+hana-aa-graph-overview.html
+[11] 2024. JanusGraph. https://janusgraph.org/
+[12] 2024. LDBC Graphalytics Benchmark (LDBC Graphalytics). https://ldbcouncil.
+org/benchmarks/graphalytics/
+[13] 2024. LDBC SNB Business Intelligence (BI) workload implementations.
+https:
+//github.com/ldbc/ldbc_snb_bi
+[14] 2024.
+LDBC SNB Interactive v2 workload implementations.
+https:
+//github.com/ldbc/ldbc_snb_interactive_v1_impls#ldbc-snb-interactive-
+v2-workload-implementations
+[15] 2024. Neo4j. https://neo4j.com/
+[16] 2024. OpenMP. https://www.openmp.org/
+[17] 2024. OQGRAPH Overview. https://mariadb.com/kb/en/oqgraph-overview/
+[18] 2024. Oracle Big Data Spatial and Graph. https://www.oracle.com/database/
+technologies/bigdata-spatialandgraph.html
+[19] 2024. Spruce. https://github.com/Stardust-SJF/Spruce
+[20] Wing Lung Ngai Stijn Heldens Arnau Prat-Pérez Thomas Manhardto Hassan
+Chafio Mihai Capotă Narayanan Sundaram Michael Anderson Ilie Gabriel Tă-
+nase Yinglong Xia Lifeng Nai Alexandru Iosup, Tim Hegeman and Peter Boncz.
+2017. LDBC Graphalytics Benchmark specification, v0.9.0.
+[21] Khaled Ammar. 2016. Techniques and Systems for Large Dynamic Graphs. In
+Proceedings of the 2016 on SIGMOD’16 PhD Symposium (San Francisco, California,
+USA) (SIGMOD’16 PhD). Association for Computing Machinery, New York, NY,
+USA, 7–11. https://doi.org/10.1145/2926693.2929897
+[22] Panagiotis Antonopoulos, Peter Byrne, Wayne Chen, Cristian Diaconu,
+Raghavendra Thallam Kodandaramaih, Hanuma Kodavalla, Prashanth Pur-
+nananda, Adrian-Leonard Radu, Chaitanya Sreenivas Ravella, and Girish Mittur
+Venkataramanappa. 2019. Constant time recovery in Azure SQL database. Proc.
+VLDB Endow. 12, 12 (aug 2019), 2143–2154. https://doi.org/10.14778/3352063.
+3352131
+[23] Timothy G. Armstrong, Vamsi Ponnekanti, Dhruba Borthakur, and Mark
+Callaghan. 2013. LinkBench: A Database Benchmark Based on the Facebook
+Social Graph (SIGMOD ’13). https://doi.org/10.1145/2463676.2465296
+[24] Joy Arulraj, Justin Levandoski, Umar Farooq Minhas, and Per-Ake Larson. 2018.
+Bztree: A High-Performance Latch-Free Range Index for Non-Volatile Memory.
+Proc. VLDB Endow. 11, 5 (2018). https://doi.org/10.1145/3164135.3164147
+[25] Greg Barnes. 1993. A Method for Implementing Lock-Free Shared-Data Struc-
+tures. In Proceedings of the Fifth Annual ACM Symposium on Parallel Algorithms
+and Architectures (Velen, Germany) (SPAA ’93). Association for Computing Ma-
+chinery, New York, NY, USA, 261–270. https://doi.org/10.1145/165231.165265
+[26] Hal Berenson, Phil Bernstein, Jim Gray, Jim Melton, Elizabeth O’Neil, and Patrick
+O’Neil. 1995. A critique of ANSI SQL isolation levels. SIGMOD Rec. 24, 2 (may
+1995), 1–10. https://doi.org/10.1145/568271.223785
+[27] Maciej Besta, Marc Fischer, Vasiliki Kalavri, Michael Kapralov, and Torsten
+Hoefler. 2023. Practice of Streaming Processing of Dynamic Graphs: Con-
+cepts, Models, and Systems. IEEE Trans. Parallel Distrib. Syst. 34, 6 (June 2023),
+1860–1876. https://doi.org/10.1109/TPDS.2021.3131677
+[28] Maciej Besta, Robert Gerstenberger, Marc Fischer, Michał Podstawski, Jürgen
+Müller, Nils Blach, Berke Egeli, George Mitenkov, Wojciech Chlapek, Marek
+Michalewicz, and Torsten Hoefler. 2023. The Graph Database Interface: Scaling
+Online Transactional and Analytical Graph Workloads to Hundreds of Thou-
+sands of Cores. arXiv:2305.11162 [cs.DB]
+[29] Maciej Besta, Robert Gerstenberger, Emanuel Peter, Marc Fischer, Michał Pod-
+stawski, Claude Barthels, Gustavo Alonso, and Torsten Hoefler. 2023. Demysti-
+fying Graph Databases: Analysis and Taxonomy of Data Organization, System
+Designs, and Graph Queries. ACM Comput. Surv. 56, 2, Article 31 (sep 2023),
+40 pages. https://doi.org/10.1145/3604932
+[30] Kai Zeng Bolin Ding and Wenyuan Yu. 2020. Alibaba Sponsor Talk at VLDB.
+[31] Chiranjeeb Buragohain, Knut Magne Risvik, Paul Brett, Miguel Castro, Wonhee
+Cho, Joshua Cowhig, Nikolas Gloy, Karthik Kalyanaraman, Richendra Khanna,
+John Pao, Matthew Renzelmann, Alex Shamis, Timothy Tan, and Shuheng Zheng.
+2020. A1: A Distributed In-Memory Graph Database. In Proceedings of the 2020
+ACM SIGMOD International Conference on Management of Data (SIGMOD ’20).
+329–344. https://doi.org/10.1145/3318464.3386135
+[32] Hongzhi Chen, Changji Li, Chenguang Zheng, Chenghuan Huang, Juncheng
+Fang, James Cheng, and Jian Zhang. 2022. G-Tran: A High Performance Dis-
+tributed Graph Database with a Decentralized Architecture. Proc. VLDB Endow.
+15, 11 (jul 2022), 2545–2558. https://doi.org/10.14778/3551793.3551813
+[33] Rong Chen, Jiaxin Shi, Yanzhe Chen, Binyu Zang, Haibing Guan, and Haibo
+Chen. 2019. PowerLyra: Differentiated Graph Computation and Partitioning on
+Skewed Graphs. ACM Trans. Parallel Comput. (2019). https://doi.org/10.1145/
+3298989
+[34] Audrey Cheng, Xiao Shi, Aaron Kabcenell, Shilpa Lawande, Hamza Qadeer, Jason
+Chan, Harrison Tin, Ryan Zhao, Peter Bailis, Mahesh Balakrishnan, Nathan
+Bronson, Natacha Crooks, and Ion Stoica. 2022. TAOBench: an end-to-end
+benchmark for social network workloads. Proc. VLDB Endow. 15, 9 (2022).
+https://doi.org/10.14778/3538598.3538616
+[35] Audrey Cheng, Jack Waudby, Hugo Firth, Natacha Crooks, and Ion Stoica. [n. d.].
+Mammoths Are Slow: The Overlooked Transactions of Graph Data. ([n. d.]).
+[36] Miaomiao Cheng, Jiujian Chen, Cheng Zhao, Cheng Chen, Yongmin Hu, Xiao-
+liang Cong, Liang Qin, Hexiang Lin, Ronghua Li, Guoren Wang, Shuai Zhang,
+and Lei Zhang. 2023. ByteGAP: A Non-continuous Distributed Graph Com-
+puting System using Persistent Memory (CEUR Workshop Proceedings). CEUR-
+WS.org. https://ceur-ws.org/Vol-3462/ADMS7.pdf
+[37] Dean De Leo. [n. d.]. graphlog. https://github.com/whatsthecraic/graphlog
+[38] Dean De Leo and Peter Boncz. 2019. Fast Concurrent Reads and Updates with
+PMAs (GRADES-NDA’19). Association for Computing Machinery, New York,
+NY, USA, Article 8, 8 pages. https://doi.org/10.1145/3327964.3328497
+
+=== PAGE 17 ===
+GTX: A Write-Optimized Latch-free Graph Data System with Transactional Support - Extended Version
+GTX Technical Report, 2025, arxiv
+[39] Dean De Leo and Peter Boncz. 2021. Teseo and the Analysis of Structural
+Dynamic Graphs. 14, 6 (feb 2021), 1053–1066. https://doi.org/10.14778/3447689.
+3447708
+[40] Alin Deutsch, Yu Xu, Mingxi Wu, and Victor Lee. 2019. TigerGraph: A Native
+MPP Graph Database. (01 2019).
+[41] Laxman Dhulipala, Guy E. Blelloch, and Julian Shun. 2019. Low-Latency Graph
+Streaming Using Compressed Purely-Functional Trees. In Proceedings of the 40th
+ACM SIGPLAN Conference on Programming Language Design and Implementation
+(PLDI 2019). https://doi.org/10.1145/3314221.3314598
+[42] Cristian Diaconu, Craig Freedman, Erik Ismert, Per-Ake Larson, Pravin Mittal,
+Ryan Stonecipher, Nitin Verma, and Mike Zwilling. 2013. Hekaton: SQL server’s
+memory-optimized OLTP engine. In Proceedings of the 2013 ACM SIGMOD
+International Conference on Management of Data (New York, New York, USA)
+(SIGMOD ’13). Association for Computing Machinery, New York, NY, USA,
+1243–1254. https://doi.org/10.1145/2463676.2463710
+[43] Ayush Dubey, Greg D. Hill, Robert Escriva, and Emin Gün Sirer. 2016. Weaver:
+A High-Performance, Transactional Graph Database Based on Refinable Times-
+tamps. Proc. VLDB Endow. 9, 11 (jul 2016), 852–863. https://doi.org/10.14778/
+2983200.2983202
+[44] David Ediger, Rob McColl, Jason Riedy, and David A. Bader. 2012. STINGER:
+High performance data structure for streaming graphs. In 2012 IEEE Conference
+on High Performance Extreme Computing. 1–5. https://doi.org/10.1109/HPEC.
+2012.6408680
+[45] Orri Erling, Alex Averbuch, Josep Larriba-Pey, Hassan Chafi, Andrey Gubichev,
+Arnau Prat, Minh-Duc Pham, and Peter Boncz. 2015. The LDBC Social Net-
+work Benchmark: Interactive Workload (SIGMOD ’15). https://doi.org/10.1145/
+2723372.2742786
+[46] Michalis Faloutsos, Petros Faloutsos, and Christos Faloutsos. 1999. On Power-
+Law Relationships of the Internet Topology (SIGCOMM ’99). https://doi.org/10.
+1145/316188.316229
+[47] Wenfei Fan, Tao He, Longbin Lai, Xue Li, Yong Li, Zhao Li, Zhengping Qian,
+Chao Tian, Lei Wang, Jingbo Xu, Youyang Yao, Qiang Yin, Wenyuan Yu, Jingren
+Zhou, Diwen Zhu, and Rong Zhu. 2021. GraphScope: a unified engine for big
+graph processing. 14, 12 (jul 2021), 2879–2892. https://doi.org/10.14778/3476311.
+3476369
+[48] Zhuochen Fan, Yalun Cai, Zirui Liu, Jiarui Guo, Xin Fan, Tong Yang, and Bin
+Cui. 2024. CuckooGraph: A Scalable and Space-Time Efficient Data Structure
+for Large-Scale Dynamic Graphs. CoRR abs/2405.15193 (2024). https://doi.org/
+10.48550/arXiv.2405.15193
+[49] Guanyu Feng, Zixuan Ma, Daixuan Li, Shengqi Chen, Xiaowei Zhu, Wentao
+Han, and Wenguang Chen. 2021. RisGraph: A Real-Time Streaming System for
+Evolving Graphs to Support Sub-Millisecond Per-Update Analysis at Millions
+Ops/s (SIGMOD ’21). https://doi.org/10.1145/3448016.3457263
+[50] Xiyang Feng, Guodong Jin, Ziyi Chen, Chang Liu, and Semih Salihoğlu. 2023.
+KÙZU Graph Database Management System. CIDR.
+[51] Soukaina Firmli, Vasileios Trigonakis, Jean-Pierre Lozi, Iraklis Psaroudakis,
+Alexander Weld, Chiadmi Dalila, Sungpack Hong, and Hassan Chafi. 2020.
+CSR++: A Fast, Scalable, Update-Friendly Graph Data Structure. https://doi.
+org/10.4230/LIPIcs.OPODIS.2020.17
+[52] Per Fuchs, Domagoj Margan, and Jana Giceva. 2022. Sortledton: A Univer-
+sal, Transactional Graph Data Structure. Proc. VLDB Endow. 15, 6 (feb 2022),
+1173–1186. https://doi.org/10.14778/3514061.3514065
+[53] Sanchit Garg, Trinabh Gupta, Niklas Carlsson, and Anirban Mahanti. 2009.
+Evolution of an Online Social Aggregation Network: An Empirical Study. In
+Proceedings of the 9th ACM SIGCOMM Conference on Internet Measurement (IMC
+’09). https://doi.org/10.1145/1644893.1644931
+[54] Pranjal Gupta, Amine Mhedhbi, and Semih Salihoglu. 2021. Columnar storage
+and list-based processing for graph database management systems. Proc. VLDB
+Endow. 14, 11 (jul 2021), 2491–2504. https://doi.org/10.14778/3476249.3476297
+[55] Pankaj Gupta, Venu Satuluri, Ajeet Grewal, Siva Gurumurthy, Volodymyr
+Zhabiuk, Quannan Li, and Jimmy Lin. 2014. Real-Time Twitter Recommenda-
+tion: Online Motif Detection in Large Dynamic Graphs. Proc. VLDB Endow. 7,
+13 (aug 2014). https://doi.org/10.14778/2733004.2733010
+[56] Mohamed S. Hassan, Tatiana Kuznetsova, Hyun Chai Jeong, Walid G. Aref, and
+Mohammad Sadoghi. 2018. Extending In-Memory Relational Database Engines
+with Native Graph Support. In International Conference on Extending Database
+Technology. https://api.semanticscholar.org/CorpusID:11389988
+[57] Jim Webber Ian Robinson and Emil Eifrem. 2015. Graph Databases: New Oppor-
+tunities for Connected Data (2nd ed.). O’Reilly Media, Inc.
+[58] Borislav Iordanov. 2010. HyperGraphDB: A Generalized Graph Database. In
+Web-Age Information Management, Heng Tao Shen, Jian Pei, M. Tamer Özsu,
+Lei Zou, Jiaheng Lu, Tok-Wang Ling, Ge Yu, Yi Zhuang, and Jie Shao (Eds.).
+Springer Berlin Heidelberg, Berlin, Heidelberg, 25–36.
+[59] Alexandru Iosup, Tim Hegeman, Wing Lung Ngai, Stijn Heldens, Arnau Prat-
+Pérez, Thomas Manhardto, Hassan Chafio, Mihai Capotă, Narayanan Sundaram,
+Michael Anderson, Ilie Gabriel Tănase, Yinglong Xia, Lifeng Nai, and Peter
+Boncz. 2016. LDBC Graphalytics: A Benchmark for Large-Scale Graph Analysis
+on Parallel and Distributed Platforms. 9, 13 (2016), 12 pages. https://doi.org/10.
+14778/3007263.3007270
+[60] Muhammad Attahir Jibril, Hani Al-Sayeh, Alexander Baumstark, and Kai-
+Uwe Sattler. 2023. Fast and Efficient Update Handling for Graph H2TAP. In
+Proceedings 26th International Conference on Extending Database Technology,
+EDBT 2023, Ioannina, Greece, March 28-31, 2023. OpenProceedings.org, 723–736.
+https://doi.org/10.48786/edbt.2023.60
+[61] Chathura Kankanamge, Siddhartha Sahu, Amine Mhedbhi, Jeremy Chen, and
+Semih Salihoglu. 2017. Graphflow: An Active Graph Database (SIGMOD ’17).
+Association for Computing Machinery. https://doi.org/10.1145/3035918.3056445
+[62] Alexander D. Kent, Lorie M. Liebrock, and Joshua C. Neil. 2015. Authentication
+graphs: Analyzing user behavior within an enterprise network. Computers &
+Security 48 (2015), 150–166. https://doi.org/10.1016/j.cose.2014.09.001
+[63] Kenneth C. Knowlton. 1965. A Fast Storage Allocator. Commun. ACM 8, 10 (oct
+1965), 623–624. https://doi.org/10.1145/365628.365655
+[64] Pradeep Kumar and H. Howie Huang. 2020. GraphOne: A Data Store for
+Real-Time Analytics on Evolving Graphs. ACM Trans. Storage 15, 4 (2020).
+https://doi.org/10.1145/3364180
+[65] Jérôme Kunegis. [n. d.]. The KONECT Project. http://konect.cc/networks/
+[66] Geof Langdale. [n. d.]. Lock-Free Programming. https://www.cs.cmu.edu/~410-
+s05/lectures/L31_LockFree.pdf
+[67] Per-Åke Larson, Spyros Blanas, Cristian Diaconu, Craig Freedman, Jignesh M.
+Patel, and Mike Zwilling. 2011. High-performance concurrency control mecha-
+nisms for main-memory databases. Proc. VLDB Endow. 5, 4 (dec 2011), 298–309.
+https://doi.org/10.14778/2095686.2095689
+[68] Dean De Leo. 2020. GFE Driver - Input graphs.
+https://zenodo.org/records/
+3966439
+[69] Jure Leskovec and Rok Sosič. 2016. SNAP: A General-Purpose Network Analysis
+and Graph-Mining Library. ACM Trans. Intell. Syst. Technol. 8, 1 (2016). https:
+//doi.org/10.1145/2898361
+[70] Justin Levandoski, David Lomet, and Sudipta Sengupta. 2013. The Bw-Tree: A
+B-tree for New Hardware Platforms. In 2013 IEEE 29th International Conference
+on Data Engineering (ICDE) (2013 ieee 29th international conference on data
+engineering (icde) ed.). IEEE.
+https://www.microsoft.com/en-us/research/
+publication/the-bw-tree-a-b-tree-for-new-hardware/
+[71] Justin Levandoski, David Lomet, Sudipta Sengupta, Ryan Stutsman, and Rui
+Wang. 2015. High Performance Transactions in Deuteronomy. In Conference on
+Innovative Data Systems Research (CIDR 2015). https://www.microsoft.com/en-
+us/research/publication/high-performance-transactions-in-deuteronomy/
+[72] Changji Li, Hongzhi Chen, Shuai Zhang, Yingqian Hu, Chao Chen, Zhenjie
+Zhang, Meng Li, Xiangchen Li, Dongqing Han, Xiaohui Chen, Xudong Wang,
+Huiming Zhu, Xuwei Fu, Tingwei Wu, Hongfei Tan, Hengtian Ding, Mengjin
+Liu, Kangcheng Wang, Ting Ye, Lei Li, Xin Li, Yu Wang, Chenguang Zheng, Hao
+Yang, and James Cheng. 2022. ByteGraph: A High-Performance Distributed
+Graph Database in ByteDance. Proc. VLDB Endow. 15, 12 (2022). https://doi.
+org/10.14778/3554821.3554824
+[73] Hongfu Li. 2024. GastCoCo: Graph Storage and Coroutine-Based Prefetch
+Co-Design for Dynamic Graph Processing. arXiv:2312.14396 [cs.DB] https:
+//arxiv.org/abs/2312.14396
+[74] Tianyu Li, Badrish Chandramouli, and Samuel Madden. 2022. Performant
+Almost-Latch-Free Data Structures Using Epoch Protection. In Data Man-
+agement on New Hardware (Philadelphia, PA, USA) (DaMoN’22). Association
+for Computing Machinery, New York, NY, USA, Article 1, 10 pages.
+https:
+//doi.org/10.1145/3533737.3535091
+[75] Hyeontaek Lim, Michael Kaminsky, and David G. Andersen. 2017. Cicada:
+Dependably Fast Multi-Core In-Memory Transactions. In Proceedings of the
+2017 ACM International Conference on Management of Data (Chicago, Illinois,
+USA) (SIGMOD ’17). Association for Computing Machinery, New York, NY, USA,
+21–35. https://doi.org/10.1145/3035918.3064015
+[76] Heng Lin, Zhiyong Wang, Shipeng Qi, Xiaowei Zhu, Chuntao Hong, Wenguang
+Chen, and Yingwei Luo. 2024. Building a High-Performance Graph Storage on
+Top of Tree-Structured Key-Value Stores. Big Data Mining and Analytics 7, 1
+(2024), 156–170. https://doi.org/10.26599/BDMA.2023.9020015
+[77] Memgraph Ltd. [n. d.]. Memgraph. https://memgraph.com/
+[78] Peter Macko, Virendra J. Marathe, Daniel W. Margo, and Margo I. Seltzer. 2015.
+LLAMA: Efficient graph analytics using Large Multiversioned Arrays. In 2015
+IEEE 31st International Conference on Data Engineering. 363–374. https://doi.
+org/10.1109/ICDE.2015.7113298
+[79] Arlino Magalhaes, Jose Maria Monteiro, and Angelo Brayner. 2021. Main Mem-
+ory Database Recovery: A Survey. ACM Comput. Surv. 54, 2, Article 46 (mar
+2021), 36 pages. https://doi.org/10.1145/3442197
+[80] Norbert Martínez-Bazan, M. Ángel Águila Lorente, Victor Muntés-Mulero, David
+Dominguez-Sal, Sergio Gómez-Villamor, and Josep-L. Larriba-Pey. 2012. Effi-
+cient graph management based on bitmap indices. In Proceedings of the 16th
+International Database Engineering & Applications Sysmposium (Prague, Czech
+Republic) (IDEAS ’12). Association for Computing Machinery, New York, NY,
+USA, 110–119. https://doi.org/10.1145/2351476.2351489
+
+=== PAGE 18 ===
+GTX Technical Report, 2025, arxiv
+Libin Zhou, Lu Xing, Yeasir Rayhan, Walid. G. Aref
+[81] Prashant Pandey, Brian Wheatman, Helen Xu, and Aydin Buluc. 2021. Terrace:
+A Hierarchical Graph Container for Skewed Dynamic Graphs (SIGMOD ’21).
+https://doi.org/10.1145/3448016.3457313
+[82] K. Platz, N. Mittal, and S. Venkatesan. 2019. Concurrent Unrolled Skiplist. In 2019
+IEEE 39th International Conference on Distributed Computing Systems (ICDCS).
+https://doi.org/10.1109/ICDCS.2019.00157
+[83] David Püroja, Jack Waudby, Peter Boncz, and Gábor Szárnyas. 2023. The LDBC
+Social Network Benchmark Interactive workload v2: A transactional graph
+query benchmark with deep delete operations. arXiv:2307.04820 [cs.DB]
+[84] Hao Qi, Yiyang Wu, Ligang He, Yu Zhang, Kang Luo, Minzhi Cai, Hai Jin, Zhan
+Zhang, and Jin Zhao. 2024. LSGraph: A Locality-centric High-performance
+Streaming Graph Engine. In Proceedings of the Nineteenth European Conference
+on Computer Systems (Athens, Greece) (EuroSys ’24). Association for Computing
+Machinery, New York, NY, USA, 33–49. https://doi.org/10.1145/3627703.3650076
+[85] Xiafei Qiu, Wubin Cen, Zhengping Qian, You Peng, Ying Zhang, Xuemin Lin, and
+Jingren Zhou. 2018. Real-Time Constrained Cycle Detection in Large Dynamic
+Graphs. 11, 12 (2018). https://doi.org/10.14778/3229863.3229874
+[86] Christopher Rickett, Kristyn Maschhoff, and Sreenivas Rangan Sukumar. 2024.
+Optimizing the Cray Graph Engine for performant analytics on cluster, Super-
+Dome Flex, Shasta systems and cloud deployment. Concurrency and Computa-
+tion: Practice and Experience 36 (01 2024). https://doi.org/10.1002/cpe.7982
+[87] Siddhartha Sahu, Amine Mhedhbi, Semih Salihoglu, Jimmy Lin, and M. Tamer
+Özsu. 2017. The Ubiquity of Large Graphs and Surprising Challenges of Graph
+Processing. Proc. VLDB Endow. 11, 4 (2017). https://doi.org/10.1145/3186728.
+3164139
+[88] HANS-JÜRGEN SCHÖNIG. 2023. Speeding up things with hint bits.
+https:
+//www.cybertec-postgresql.com/en/speeding-up-things-with-hint-bits/
+[89] Bin Shao, Haixun Wang, and Yatao Li. 2013. Trinity: a distributed graph engine
+on a memory cloud. In Proceedings of the 2013 ACM SIGMOD International
+Conference on Management of Data (New York, New York, USA) (SIGMOD ’13).
+Association for Computing Machinery, New York, NY, USA, 505–516. https:
+//doi.org/10.1145/2463676.2467799
+[90] Aneesh Sharma, Jerry Jiang, Praveen Bommannavar, Brian Larson, and Jimmy
+Lin. 2016. GraphJet: Real-Time Content Recommendations at Twitter. Proc.
+VLDB Endow. 9, 13 (2016). https://doi.org/10.14778/3007263.3007267
+[91] Aneesh Sharma, Jerry Jiang, Praveen Bommannavar, Brian Larson, and Jimmy
+Lin. 2016. GraphJet: Real-Time Content Recommendations at Twitter. Proc.
+VLDB Endow. 9, 13 (2016). https://doi.org/10.14778/3007263.3007267
+[92] Supreeth Shastri, Vinay Banakar, Melissa Wasserman, Arun Kumar, and Vijay
+Chidambaram. 2020. Understanding and benchmarking the impact of GDPR
+on database systems. Proc. VLDB Endow. 13, 7 (mar 2020), 1064–1077. https:
+//doi.org/10.14778/3384345.3384354
+[93] Sijie Shen, Rong Chen, Haibo Chen, and Binyu Zang. 2021. Retrofitting High
+Availability Mechanism to Tame Hybrid Transaction/Analytical Processing. In
+15th USENIX Symposium on Operating Systems Design and Implementation (OSDI
+21). USENIX Association, 219–238. https://www.usenix.org/conference/osdi21/
+presentation/shen
+[94] Sijie Shen, Zihang Yao, Lin Shi, Lei Wang, Longbin Lai, Qian Tao, Li Su, Rong
+Chen, Wenyuan Yu, Haibo Chen, Binyu Zang, and Jingren Zhou. 2023. Bridging
+the Gap between Relational OLTP and Graph-based OLAP. In 2023 USENIX
+Annual Technical Conference (USENIX ATC 23). USENIX Association.
+https:
+//www.usenix.org/conference/atc23/presentation/shen
+[95] Jifan Shi, Biao Wang, and Yun Xu. 2024. Spruce: a Fast yet Space-saving Structure
+for Dynamic Graph Storage. Proc. ACM Manag. Data 2, 1, Article 27 (mar 2024),
+26 pages. https://doi.org/10.1145/3639282
+[96] Kimmo Soramäki, Morten L. Bech, Jeffrey Arnold, Robert J. Glass, and Walter E.
+Beyeler. 2007. The topology of interbank payment flows. Physica A: Statistical
+Mechanics and its Applications (2007). https://doi.org/10.1016/j.physa.2006.11.
+093
+[97] Wen Sun, Achille Fokoue, Kavitha Srinivas, Anastasios Kementsietsidis, Gang
+Hu, and Guotong Xie. 2015. SQLGraph: An Efficient Relational-Based Property
+Graph Store. In Proceedings of the 2015 ACM SIGMOD International Conference on
+Management of Data (Melbourne, Victoria, Australia) (SIGMOD ’15). Association
+for Computing Machinery, New York, NY, USA, 1887–1901. https://doi.org/10.
+1145/2723372.2723732
+[98] Gábor Szárnyas, Jack Waudby, Benjamin A. Steer, Dávid Szakállas, Altan Birler,
+Mingxi Wu, Yuchen Zhang, and Peter Boncz. 2022. The LDBC Social Network
+Benchmark: Business Intelligence Workload. Proc. VLDB Endow. 16, 4 (2022).
+https://doi.org/10.14778/3574245.3574270
+[99] Stephen Tu, Wenting Zheng, Eddie Kohler, Barbara Liskov, and Samuel Madden.
+2013. Speedy transactions in multicore in-memory databases. In Proceedings of
+the Twenty-Fourth ACM Symposium on Operating Systems Principles (Farminton,
+Pennsylvania) (SOSP ’13). Association for Computing Machinery, New York, NY,
+USA, 18–32. https://doi.org/10.1145/2517349.2522713
+[100] Ziqi Wang, Andrew Pavlo, Hyeontaek Lim, Viktor Leis, Huanchen Zhang,
+Michael Kaminsky, and David G. Andersen. 2018. Building a Bw-Tree Takes
+More Than Just Buzz Words (SIGMOD ’18). Association for Computing Machin-
+ery, New York, NY, USA, 473–488. https://doi.org/10.1145/3183713.3196895
+[101] Todd Warszawski and Peter Bailis. 2017. ACIDRain: Concurrency-Related At-
+tacks on Database-Backed Web Applications. In Proceedings of the 2017 ACM
+International Conference on Management of Data (Chicago, Illinois, USA) (SIG-
+MOD ’17). Association for Computing Machinery, New York, NY, USA, 5–20.
+https://doi.org/10.1145/3035918.3064037
+[102] Jack Waudby, Paul Ezhilchelvan, Jim Webber, and Isi Mitrani. 2020. Preserving
+reciprocal consistency in distributed graph databases. In Proceedings of the 7th
+Workshop on Principles and Practice of Consistency for Distributed Data (PaPoC
+’20). Association for Computing Machinery. https://doi.org/10.1145/3380787.
+3393675
+[103] Victor Junqiu Wei, Raymond Chi-Wing Wong, and Cheng Long. 2020.
+Architecture-Intact Oracle for Fastest Path and Time Queries on Dynamic
+Spatial Networks (SIGMOD ’20). Association for Computing Machinery, New
+York, NY, USA. https://doi.org/10.1145/3318464.3389718
+[104] Brian Wheatman and Randal Burns. 2021. Streaming Sparse Graphs using
+Efficient Dynamic Sets. In 2021 IEEE International Conference on Big Data (Big
+Data). 284–294. https://doi.org/10.1109/BigData52589.2021.9671836
+[105] Brian Wheatman and Helen Xu. 2018. Packed Compressed Sparse Row: A Dy-
+namic Graph Representation. In 2018 IEEE High Performance extreme Computing
+Conference (HPEC). 1–7. https://doi.org/10.1109/HPEC.2018.8547566
+[106] Daniel ten Wolde, Gábor Szárnyas, and Peter Boncz. 2023. DuckPGQ: Bringing
+SQL/PGQ to DuckDB. Proc. VLDB Endow. 16, 12 (aug 2023), 4034–4037. https:
+//doi.org/10.14778/3611540.3611614
+[107] Yingjun Wu, Joy Arulraj, Jiexi Lin, Ran Xian, and Andrew Pavlo. 2017. An
+Empirical Evaluation of In-Memory Multi-Version Concurrency Control. Proc.
+VLDB Endow. 10, 7 (2017). https://doi.org/10.14778/3067421.3067427
+[108] Xiangyao Yu, Andrew Pavlo, Daniel Sanchez, and Srinivas Devadas. 2016. TicToc:
+Time Traveling Optimistic Concurrency Control. In Proceedings of the 2016
+International Conference on Management of Data (San Francisco, California,
+USA) (SIGMOD ’16). Association for Computing Machinery, New York, NY, USA,
+1629–1642. https://doi.org/10.1145/2882903.2882935
+[109] Wenting Zheng, Stephen Tu, Eddie Kohler, and Barbara Liskov. 2014. Fast
+Databases with Fast Durability and Recovery Through Multicore Parallelism.
+In 11th USENIX Symposium on Operating Systems Design and Implementation
+(OSDI 14). USENIX Association, Broomfield, CO, 465–477. https://www.usenix.
+org/conference/osdi14/technical-sessions/presentation/zheng_wenting
+[110] K. Zhou, G. Tan, and W. Zhou. 2018. Quadboost: A Scalable Concurrent Quadtree.
+IEEE Transactions on Parallel &amp; Distributed Systems 29, 03 (2018). https:
+//doi.org/10.1109/TPDS.2017.2762298
+[111] Xiaowei Zhu, Guanyu Feng, Marco Serafini, Xiaosong Ma, Jiping Yu, Lei Xie,
+Ashraf Aboulnaga, and Wenguang Chen. 2020. LiveGraph: A Transactional
+Graph Storage System with Purely Sequential Adjacency List Scans. 13, 7 (mar
+2020), 1020–1034. https://doi.org/10.14778/3384345.3384351

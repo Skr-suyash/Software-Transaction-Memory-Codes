@@ -1,0 +1,97 @@
+% GTX-GPU architecture diagram (shared by main.tex and arch.tex). Needs colour cGTX and tikz libs arrows.meta, positioning, calc.
+\begin{tikzpicture}[font=\sffamily\scriptsize, >={Stealth[length=4pt]},
+  cell/.style={draw, minimum width=0.55cm, minimum height=0.42cm, inner sep=0pt, anchor=center},
+  hd/.style={cell, fill=cGTX!12},
+  dl/.style={cell, fill=white},
+  sl/.style={cell, fill=black!25},
+  vd/.style={cell, fill=black!6, text=black!45},
+  ttl/.style={font=\sffamily\scriptsize\bfseries, anchor=west},
+  box/.style={draw, rounded corners=2pt, inner sep=3pt},
+  lk/.style={->, cGTX, thick},
+  note/.style={font=\sffamily\tiny, align=left, anchor=north west}]
+
+% ---------------- vertex arrays ----------------
+\node[ttl] at (-0.2,5.75) {Vertex arrays};
+\node at (0.95,5.3) {\texttt{vcur[u]}};
+\node at (2.25,5.3) {\texttt{vfill[u]}};
+\foreach \u/\y/\g/\f in {0/4.85/0/5, 1/4.4/1/12, 3/3.5/0/2} {
+  \node at (0.05,\y) {\u};
+  \node[cell, minimum width=0.85cm] at (0.95,\y) {\g};
+  \node[cell, minimum width=1.3cm] at (2.25,\y) {(\g\,|\,\f)};
+}
+\node at (0.05,3.95) {2};
+\node[cell, minimum width=0.85cm, fill=cGTX!25] at (0.95,3.95) {$g$};
+\node[cell, minimum width=1.3cm, fill=cGTX!25] (vf2) at (2.25,3.95) {($g$\,|\,37)};
+\node[note, text width=3.1cm] at (-0.25,3.1)
+  {Readers load \texttt{vcur[u]}.\\ Writers do one \texttt{fetch\_add} on \texttt{vfill[u]} per (warp, vertex): the high half
+   names the generation, the low half the slot.};
+
+% ---------------- generation g ----------------
+\node[box, minimum width=7.0cm, minimum height=2.15cm, anchor=north west] (G1) at (3.35,5.95) {};
+\node[ttl] at (3.4,5.75) {Block generation $g$ of vertex 2 \ (cap $=8\times$ cap$_{g-1}$)};
+\node[anchor=east] at (4.6,5.2) {heads $H$};
+\foreach \i in {0,...,7} { \node[hd] (ha\i) at (4.95+\i*0.6,5.2) {}; }
+\node at (9.95,5.2) {$\cdots$};
+\node[anchor=east] at (4.6,4.3) {deltas};
+\foreach \i/\t/\s in {0/7\,I/dl,1/9\,I/dl,2/3\,I/dl,3/7\,D/dl,4/V/vd,5/5\,I/dl} { \node[\s] (da\i) at (4.95+\i*0.6,4.3) {\t}; }
+\foreach \i in {6,7} { \node[cell, dashed, draw=black!40, text=black!45, font=\sffamily\tiny] (da\i) at (4.95+\i*0.6,4.3) {free}; }
+\node at (9.95,4.3) {$\cdots$};
+% chains: each head points at the newest delta of its destination
+\draw[lk] (ha1.south) -- (da1.north);
+\draw[lk] (ha2.south) -- (da2.north);
+\draw[lk] (ha3.south) -- (da3.north);
+\draw[lk] (ha5.south) -- (da5.north);
+\draw[lk] (da3.south) to[out=-110,in=-70] node[below, font=\sffamily\tiny, text=cGTX, inner sep=1pt] {prev} (da0.south);
+
+% ---------------- generation g-1 ----------------
+\node[box, minimum width=7.0cm, minimum height=1.85cm, anchor=north west] (G0) at (3.35,3.25) {};
+\node[ttl] at (3.4,3.05) {Generation $g{-}1$ \ (sealed lazily, never copied)};
+\node[anchor=east] at (4.6,2.5) {heads $H$};
+\foreach \i in {2,3,5,6} { \node[hd] (hb\i) at (4.95+\i*0.6,2.5) {}; }
+\foreach \i in {0,1,4,7} { \node[sl] (hb\i) at (4.95+\i*0.6,2.5) {S}; }
+\node[anchor=east] at (4.6,1.75) {deltas};
+\foreach \i/\t in {0/2\,I,1/7\,I,2/4\,I,3/9\,D,4/1\,I,5/6\,I,6/8\,I,7/3\,D} { \node[dl] (db\i) at (4.95+\i*0.6,1.75) {\t}; }
+\draw[lk] (hb1.south) -- (db1.north);
+\draw[lk, dashed] (da0.south west) .. controls (4.62,3.4) and (4.62,2.0) .. node[pos=0.25, left, font=\sffamily\tiny, text=cGTX] {prev} (db1.north west);
+% generation link and vertex -> newest generation
+\draw[->, thick, black!60] (10.0,3.8) -- node[right, font=\sffamily\tiny] {\texttt{prevGen}} (10.0,3.25);
+\draw[->, black!60] (vf2.east) to[out=0,in=180] ($(G1.west)+(0,-0.35)$);
+\node[note, text width=7cm] at (3.35,1.2)
+  {S = head sealed by the first writer of generation $g$ that walked it (\texttt{fetch\_or SEAL}).
+   Cells show destination + op (I insert, D delete, V voided slot).
+   Chain of destination 7: $H \rightarrow$ 7D $\rightarrow$ 7I $\rightarrow$ 7I in $g{-}1$.};
+
+% ---------------- delta record ----------------
+\node[ttl] at (11.0,5.75) {Delta (32 B)};
+\node[cell, minimum width=1.6cm] (z0) at (11.85,5.2) {dst:30\,|\,op:2};
+\node[cell, minimum width=0.95cm, right=0pt of z0] (z1) {prev};
+\node[cell, minimum width=1.05cm, right=0pt of z1, fill=cGTX!12] (z2) {owner};
+\node[cell, minimum width=1.05cm, right=0pt of z2] (z3) {cts};
+\node[cell, minimum width=1.25cm, right=0pt of z3] (z4) {its};
+\draw[densely dotted, black!50] (da3.north east) -- (z0.south west);
+\node[note, text width=6.1cm] at (11.05,4.85)
+ {\texttt{owner}: creating txid.\quad \texttt{cts}: commit epoch (stamped lazily).\\
+  \texttt{its}: 0, TAG$|$txid, or invalidation epoch.};
+
+% ---------------- descriptors ----------------
+\node[ttl] at (11.0,3.95) {Transaction descriptors \texttt{desc[owner]}};
+\node[cell, minimum width=1.45cm, fill=yellow!30] (d0) at (11.8,3.4) {ACTIVE};
+\node[cell, minimum width=1.45cm, fill=green!20, right=0pt of d0] (d1) {COMMIT(41)};
+\node[cell, minimum width=1.45cm, fill=red!15, right=0pt of d1] (d2) {ABORTED};
+\node[cell, minimum width=1.45cm, fill=green!20, right=0pt of d2] (d3) {COMMIT(42)};
+\node[note, text width=6.1cm] at (11.05,3.08)
+ {Visible to $T$ iff $T$ owns it, or COMMIT($e$) with $e \le rts$.};
+
+% ---------------- group commit ----------------
+\node[ttl] at (11.0,2.45) {Group commit};
+\node[cell, minimum width=2.6cm, minimum height=0.5cm, fill=cGTX!12] (E) at (12.45,1.85) {\texttt{E} = (epoch 43 | 5 writers)};
+\node[cell, minimum width=1.5cm, minimum height=0.5cm] (done) at (15.9,1.85) {\texttt{done[e\&1]}};
+\node[draw, rounded corners=3pt, fill=black!6, minimum height=0.5cm, align=center] (adv) at (14.15,0.75) {advancer\\(warp 0, lane 0)};
+\node[cell, minimum width=1.5cm, minimum height=0.5cm, fill=green!20] (fr) at (16.5,0.75) {\texttt{frontier}=42};
+\node[font=\sffamily\tiny, align=center] (cm) at (11.75,0.75) {committing warps\\one \texttt{fetch\_add} each};
+\draw[->] (cm.north) -- (cm.north |- E.south);
+\draw[->] (adv.north west) -- node[left, font=\sffamily\tiny, pos=0.45] {exchange} (adv.north west |- E.south);
+\draw[->] (adv.north east) -- node[right, font=\sffamily\tiny, pos=0.5] {wait $=$ reg} (done.south west);
+\draw[->] (adv.east) -- node[below, font=\sffamily\tiny] {release} (fr.west);
+\node[font=\sffamily\tiny, anchor=north] at (16.5,0.45) {\texttt{begin}: $rts \leftarrow$ frontier};
+\end{tikzpicture}

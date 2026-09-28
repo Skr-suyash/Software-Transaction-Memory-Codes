@@ -1,0 +1,891 @@
+%% GTX-GPU technical report -- ACM sigconf layout (same template family as the GTX paper).
+%% Build: pdflatex main && bibtex main && pdflatex main && pdflatex main   (or build_paper.bat)
+\documentclass[sigconf,nonacm]{acmart}
+\settopmatter{printacmref=false, printfolios=true}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,shapes.misc,patterns,fit,backgrounds}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepgfplotslibrary{groupplots}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\SetAlFnt{\footnotesize}
+\SetAlCapFnt{\footnotesize}
+\SetAlCapNameFnt{\footnotesize}
+\SetCommentSty{textit}
+
+% colours used consistently in every plot
+\definecolor{cGTX}{HTML}{1F5FA8}
+\definecolor{cCONS}{HTML}{7AA6D6}
+\definecolor{cTPL}{HTML}{D95F02}
+\definecolor{cSTM}{HTML}{7570B3}
+\definecolor{cNOD}{HTML}{1B9E77}
+\definecolor{cCAS}{HTML}{8C8C8C}
+
+\newcommand{\sys}{GTX-GPU}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\hyp}[1]{\textbf{#1}}
+
+\begin{document}
+
+\title{\sys{}: Latch-free Versioned Graph Transactions with Concurrent Snapshot Readers on GPUs}
+\subtitle{Technical Report}
+
+\author{Suyash Kumar}
+\email{suyashkumar2005@gmail.com}
+\affiliation{%
+  \institution{Affiliation}
+  \country{Country}}
+
+\begin{abstract}
+Dynamic graph structures for GPUs (GPMA, LPMA, Hornet, faimGraph, SlabGraph, Meerkat) sustain hundreds of millions of
+edge updates per second, but none of them offers \emph{multi-edge transactions} or \emph{snapshot reads that run
+concurrently with updates}. General-purpose GPU software transactional memories provide atomicity, but their conflict
+detection is unaware of the graph and collapses under the skew of real-world workloads. This report presents
+\sys{}, a GPU adaptation of GTX, a write-optimized latch-free graph transaction system for CPUs. \sys{} keeps GTX's
+versioned edge deltas, per-vertex delta blocks, destination-hashed delta chains, lazily resolved transaction
+descriptors and epoch-based group commit. It changes four things for the SIMT execution model:
+(i)~\emph{destination-precise} write-write conflict detection that validates and CASes on the same observed chain head;
+(ii)~\emph{block generations} with lazy chain sealing and a fused generation/fill reservation word, which lets a warp
+reserve slots cooperatively and never copies a block under writers;
+(iii)~\emph{wait-free epoch registration} with a single advancer lane that publishes a read frontier; and
+(iv)~a \emph{serializable} mode that uses Silo-style ordering (epoch fixed before read validation).
+Each benchmarked history is validated operation by operation by a checker for snapshot isolation and
+serializability. During development the checker found five protocol defects, all fixed before any measurement.
+On an RTX~4060 Laptop GPU, \sys{} is 14--23$\times$ faster than two-phase locking and a TL2 word-STM on the same
+storage when 90\% of transactions are snapshot readers. With concurrent readers on Zipf workloads, serializable
+read-write mixes, large transactions or hub contention, the advantage grows to two to four orders of magnitude.
+\sys{} is 8.6--20$\times$ faster than GPMA+ on identical update streams. We also report where \sys{} loses:
+uncontended small transactions (0.47--0.76$\times$ of 2PL), write-only contention against a degree-free STM, and
+2.5--20$\times$ memory overhead because version reclamation is not yet implemented.
+\end{abstract}
+
+\begin{CCSXML}
+<ccs2012>
+<concept><concept_id>10002951.10002952.10002953.10010146</concept_id>
+<concept_desc>Information systems~Graph-based database models</concept_desc><concept_significance>500</concept_significance></concept>
+<concept><concept_id>10002951.10002952.10003190.10003193</concept_id>
+<concept_desc>Information systems~Database transaction processing</concept_desc><concept_significance>500</concept_significance></concept>
+<concept><concept_id>10010147.10010169.10010170.10010174</concept_id>
+<concept_desc>Computing methodologies~Massively parallel algorithms</concept_desc><concept_significance>300</concept_significance></concept>
+</ccs2012>
+\end{CCSXML}
+\ccsdesc[500]{Information systems~Graph-based database models}
+\ccsdesc[500]{Information systems~Database transaction processing}
+\ccsdesc[300]{Computing methodologies~Massively parallel algorithms}
+
+\keywords{Dynamic graph, GPU, transaction, snapshot isolation, serializability, multi-versioning, latch-free concurrency control}
+
+\maketitle
+
+%% ===================================================================================================================
+\section{Introduction}
+
+Dynamic graphs change continuously: edges between users, accounts, devices or road segments are inserted and deleted
+while analytics and point queries run over the same graph. GPUs are an attractive home for such graphs. They offer an
+order of magnitude more memory bandwidth and thread-level parallelism than a CPU socket, and a line of GPU-resident
+dynamic-graph structures has pushed raw update rates into the hundreds of millions of edges per second. SlabGraph, for
+example, reports 501--641~MEdge/s for batched insertions on a TITAN~V~\cite{slabgraph}.
+
+These structures share one gap. They apply updates \emph{batch-at-a-time}, with no atomicity across edges and no
+consistent view for readers that run while a batch is applied~\cite{gpma,lpma,hornet,faimgraph,slabgraph,meerkat,survey25}.
+Applications that must move an edge (delete $(u,v)$, insert $(u,w)$), insert both directions of an undirected edge, or
+update an adjacency list together with a degree counter need \emph{multi-edge transactions}. Analytics that run
+concurrently with updates need \emph{snapshots}. On the GPU the only general answer today is a software transactional
+memory~\cite{gpustm,prstm,csmv}. A word-based STM treats the adjacency structure as anonymous memory words, so every
+insert into a hub vertex conflicts on the hub's degree word and on nearby hash slots.
+
+On the CPU, GTX~\cite{gtx} addresses the same problem for main-memory graph systems. It stores each vertex's adjacency
+as a block of \emph{edge deltas} (versions with creation and invalidation timestamps). It indexes the deltas by
+destination into \emph{delta chains}, which serve both as a lookup accelerator and as the granularity of write-write
+conflict detection. Transaction descriptors are resolved lazily by readers, and commit happens in groups against
+global read/write epochs. GTX reports up to 11$\times$ higher transaction throughput than LiveGraph, Teseo and
+Sortledton on write-heavy, temporally skewed workloads~\cite{gtx,livegraph,teseo,sortledton}.
+
+This report asks whether that architecture can be moved to a GPU, and what must change. Four GPU properties make a
+direct port unsuitable:
+\begin{itemize}
+\item \textbf{Lockstep warps and hub skew.} Thirty-two lanes of a warp often target the same hub vertex. Per-lane
+atomics on the vertex's allocation counter serialize at one L2 slice, and blocking locks inside a warp collective can
+deadlock.
+\item \textbf{No stop-the-world block growth.} GTX consolidates a full edge-delta block by copying it. On a GPU,
+thousands of writers may be appending to that block when it fills.
+\item \textbf{A weak, scoped memory model.} Every visibility edge (block publication, chain head, descriptor, epoch
+frontier) needs an explicit release/acquire argument at device scope. A missing one does not fail loudly; it produces
+a rare wrong read.
+\item \textbf{Validation at scale.} A kernel commits millions of transactions in milliseconds. Comparing the final graph
+against a log, the usual check in GPU prototypes, cannot see lost updates or torn snapshots (\S\ref{sec:checker}).
+\end{itemize}
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item \textbf{\sys{} design} (\S\ref{sec:arch}--\S\ref{sec:cc}). A GPU-resident multi-version graph store with
+transactional edge insertion and deletion, point lookups and adjacency scans, under snapshot isolation (SI) and under
+serializability (SER). GTX provides SI only~\cite{gtx}. The GPU-specific mechanisms are destination-precise
+validate-then-CAS conflict detection, block generations with lazy sealing, warp-cooperative reservation on a fused
+generation/fill word, wait-free epoch registration with a one-lane advancer, and Silo-ordered serializable
+validation~\cite{silo}.
+\item \textbf{A correctness methodology for GPU transaction protocols} (\S\ref{sec:correct}). Six invariants and their
+memory-order requirements, plus a history checker (C1--C5) that validates \emph{every} read, no-op write and scan
+against its snapshot, write-write exclusion, the final state and serialization-graph acyclicity. The checker found five
+protocol defects during development and rejects three deliberately broken protocols, two of which pass the
+final-state check.
+\item \textbf{A matched evaluation} (\S\ref{sec:eval}). Same workload streams and seeds against strict two-phase locking,
+a TL2-style word STM~\cite{tl2} with and without a degree word, non-transactional CAS updates, and GPMA+~\cite{gpma}.
+Results are medians of five repetitions with 95\% bootstrap confidence intervals, and losses are reported next to wins.
+\item \textbf{Falsifiable design hypotheses} (\S\ref{sec:ablation}). Each GPU mechanism was stated with a falsification
+criterion before it was measured. One was falsified as a primary mechanism (cooperative reservation), one was
+supported (destination-precise conflicts), and one was not falsified (epoch commit groups).
+\end{enumerate}
+
+%% ===================================================================================================================
+\section{Background and Related Work}
+\label{sec:related}
+
+\subsection{GTX}
+GTX~\cite{gtx} is a main-memory, latch-free graph data system. Each vertex owns an \emph{edge-delta block}, an
+append-only array of edge deltas. A delta records an operation on edge $(u,v)$ together with a creation timestamp and
+an invalidation timestamp. A small \emph{delta-chains index} per block hashes destinations to chains. A writer takes
+a lock bit in the chain's index entry by CAS and aborts if the CAS fails, a granularity the authors describe as
+``a middle ground between vertex and edge locks''. Transactions obtain snapshots from global read/write epochs,
+following LiveGraph~\cite{livegraph}. Commit is a hybrid group commit, and timestamps are written into deltas lazily
+after commit. GTX supports \emph{snapshot isolation only}: it detects write-write conflicts but not read-write
+conflicts.
+
+\subsection{Dynamic graphs on GPUs}
+Table~\ref{tab:space} summarizes the design space, following the recent survey of Lin, Zou and Su~\cite{survey25}.
+GPMA and GPMA+ keep edges in a sorted packed memory array. GPMA+ replaces GPMA's lock-based segment updates with
+lock-free, segment-oriented batch updates and reports up to 18.30$\times$ over GPMA~\cite{gpma,gpmatr}. LPMA levels
+the PMA to avoid global reallocation and reports 6--20$\times$ over GPMA+~\cite{lpma}. Hornet~\cite{hornet} and
+faimGraph~\cite{faimgraph} manage per-vertex arrays or pages with GPU-side allocators, and faimGraph also reclaims
+memory. SlabGraph~\cite{slabgraph} builds per-vertex SlabHash tables~\cite{slabhash} updated by warp-cooperative
+lock-free CAS. Meerkat~\cite{meerkat} extends SlabGraph with iterators for dynamic algorithms. All of these optimize
+the \emph{throughput of a batch}. None provides transactions spanning several edges or readers that observe a
+consistent state while a batch is in flight.
+
+\begin{table}[t]
+\caption{Design space of GPU dynamic-graph structures and transactional systems.}
+\label{tab:space}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{1.45cm}>{\raggedright\arraybackslash}p{2.2cm}>{\raggedright\arraybackslash}p{2.1cm}>{\raggedright\arraybackslash}p{1.9cm}@{}}
+\toprule
+System & Representation & Update sync. & Txns / snapshots \\
+\midrule
+GPMA / GPMA+ & sorted PMA & locks / lock-free segments & none (batch) \\
+LPMA & leveled PMA & segment updates & none \\
+Hornet & per-vertex arrays & batched & none \\
+faimGraph & linked pages + reclaim & warp per list & none \\
+SlabGraph, Meerkat & per-vertex slab hash & warp-coop.\ CAS & none \\
+GPU STMs & memory words & locks / versions & yes, graph-agnostic \\
+GTX (CPU) & delta blocks + chains & latch-free, group commit & SI \\
+\textbf{\sys{}} & delta generations + chains & validate-then-CAS, epochs & \textbf{SI and SER} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Transactional memory on GPUs}
+GPU-STM~\cite{gpustm} is a word- and lock-based STM designed around lockstep execution. PR-STM~\cite{prstm} resolves
+conflicts with priority rules. CSMV~\cite{csmv} uses a client-server, multi-versioned design. These systems provide
+atomic transactions over arbitrary words, but when applied to a graph they see only anonymous words: a degree counter
+or an open-addressing probe sequence becomes a conflict hot spot unrelated to the edges a transaction actually
+touches. Our STM baseline (\S\ref{sec:setup}) follows TL2~\cite{tl2}, the canonical word-STM design point: a global
+version clock, versioned lock records, commit-time sorted locking, and read-only transactions without read sets.
+
+\subsection{Isolation levels}
+Snapshot isolation~\cite{berenson} lets a transaction read a consistent snapshot and commit if no concurrent committed
+transaction wrote the same items (first-committer-wins). It admits write skew. Serializability forbids it, and a
+history is serializable iff its direct serialization graph of ww, wr and rw dependencies is acyclic~\cite{adya}.
+Serializable SI~\cite{cahill} and Silo~\cite{silo} add read validation on top of snapshot or optimistic execution.
+\sys{} follows Silo's ordering: a writer's commit epoch is fixed \emph{before} its reads are validated.
+
+%% ===================================================================================================================
+\section{\sys{} Architecture}
+\label{sec:arch}
+
+\sys{} manages a directed graph with a fixed vertex set $V$ entirely in GPU global memory. A single persistent kernel
+executes a stream of transactions, each a sequence of $K$ operations drawn from \{\textsc{insert}$(u,v)$,
+\textsc{delete}$(u,v)$, \textsc{lookup}$(u,v)$, \textsc{scan}$(u)$\}. Figure~\ref{fig:arch} shows the storage and the
+commit machinery. Table~\ref{tab:layout} lists the exact layout.
+
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{%
+\input{arch_fig}}
+\caption{\sys{} storage and commit machinery. A vertex's adjacency is a list of block generations, newest first.
+Each generation has one chain head per slot, hashed by destination, and a bump-allocated array of 32-byte deltas.
+A writer reserves a slot with one RMW on \code{vfill[u]}, validates the chain of its destination and links the delta
+by CAS on the chain head it validated. Readers decide visibility through the creator's descriptor and the published
+epoch frontier.}
+\label{fig:arch}
+\end{figure*}
+
+\subsection{Versioned edge deltas}
+Every write creates a new \emph{delta} (Table~\ref{tab:layout}), never an in-place update. A delta records its
+destination and operation (\textsc{ins}, \textsc{del}, or \textsc{void} for a reserved slot that was never linked),
+the index of the previous delta on its chain, the id of the transaction that created it (\code{owner}), its creation
+epoch \code{cts} and its invalidation stamp \code{its}. A committed deletion followed by a re-insertion is simply a
+newer \textsc{ins} version. The state of an edge for a transaction is the operation of the newest version visible to it.
+
+\begin{table}[t]
+\caption{Data layout (all in GPU global memory).}
+\label{tab:layout}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}P{1.55cm}P{6.2cm}@{}}
+\toprule
+Structure & Contents \\
+\midrule
+\code{Delta} (32 B) & \code{dstop} (dst:30, op:2), \code{prev}, \code{owner} (txid), \code{cts}, \code{its} (0, \code{TAG|txid}, or epoch); one arena, bump-allocated per block \\
+\code{Block} (32 B) & \code{base, cap, nch, chBase, prevGen}; a \emph{generation}; capacity grows by $8\times$ \\
+heads \code{H[]} & \code{idx:31 | SEAL:1}; \code{nch} $=$ \code{cap/chRatio} heads per generation (default: one per slot) \\
+\code{vcur[u]} & current generation, read by readers; published \emph{before} \code{vfill} \\
+\code{vfill[u]} (64 b) & \code{(generation<<32) | slots reserved}; writers' reservation word \\
+\code{desc[txid]} (64 b) & 0 \textsc{active}, 1 \textsc{aborted}, \code{(e<<2)|2} \textsc{committed} at epoch $e$; fresh per attempt \\
+\code{E} (64 b) & \code{(open epoch<<32) | writers registered}; one word $\Rightarrow$ wait-free registration \\
+\code{done[2]}, \code{frontier} & completion counters (epoch parity), published read epoch \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Block generations and delta chains}
+GTX consolidates a full edge-delta block into a larger one. \sys{} never copies a block while writers are active.
+When a vertex's current block fills, exactly one writer (the lane whose reservation lands on slot \code{cap}) allocates
+a generation eight times larger. The new generation is linked in \emph{front} of the old one through \code{prevGen}
+and published by release stores to \code{vcur[u]} and then \code{vfill[u]}. Each generation has its own chain heads,
+indexed by a hash of the destination; the default is one head per slot. A chain may therefore continue into older
+generations. To keep the order of versions of one key total, the first writer of generation $g{+}1$ that walks an
+older generation \emph{seals} that generation's head for its destination (\code{fetch\_or SEAL}) before walking it.
+From then on, all installs for that destination go to the newer generation (invariant I2, \S\ref{sec:inv}).
+
+\subsection{Execution model}
+The kernel is persistent. Warp~0, lane~0 is the \emph{advancer}, which closes epochs and publishes the read frontier.
+Every other lane is a worker that takes transactions from a global counter (one warp-aggregated \code{atomicAdd} per
+warp) and runs them to commit, retrying with randomized exponential backoff after an abort. Warps execute
+\code{attempt()} collectively, so lanes of one warp share reservation, commit registration and scans. A transaction
+gives up after \code{maxAttempts} attempts or on resource exhaustion; give-ups are counted and reported, never hidden.
+For each committed transaction the kernel records $(rts, cts, txid, attempts)$ and the result of every operation.
+These records feed the history checker.
+
+%% ===================================================================================================================
+\section{Transactions and Concurrency Control}
+\label{sec:cc}
+
+\subsection{Visibility and operation semantics}
+Transaction $T$ begins with snapshot $rts \leftarrow$ \code{frontier} (acquire) and a fresh descriptor in state
+\textsc{active}. A version of edge $(u,v)$ is \emph{visible} to $T$ iff $T$ created it, or its creator committed at an
+epoch $\le rts$. Visibility is decided by the creator's descriptor (read lazily) or by the stamped \code{cts}. The
+state of $(u,v)$ for $T$ is the operation of the newest visible version; an edge with no visible version is absent.
+
+\begin{itemize}
+\item \textsc{lookup}$(u,v)$ returns the state, with read-your-writes, and records which delta it observed.
+\item \textsc{insert}$(u,v)$ on a present edge (and \textsc{delete} on an absent one) is a \emph{no-op} that behaves as
+a read. Otherwise it appends an \textsc{ins} (\textsc{del}) delta. A \textsc{del} also tags the superseded
+\textsc{ins} with $\code{its} := \code{TAG}|T$.
+\item \textsc{scan}$(u)$ returns every visible \textsc{ins} of $u$ that is not invalidated by a version visible to $T$
+(degree and an order-independent hash of the neighbour set).
+\item \textsc{abort} publishes \textsc{aborted}. Nothing is rolled back: the aborted deltas are invisible forever.
+\end{itemize}
+
+\subsection{Cooperative reservation}
+A writer needs one delta slot per effective write. Algorithm~\ref{alg:resv} obtains it. Lanes of a warp that target the
+same vertex are grouped with \code{\_\_match\_any\_sync}. The group leader performs one \code{fetch\_add} of the group
+size on \code{vfill[u]} and broadcasts the result, and each lane derives its slot from its rank in the group. Because
+\code{vfill} packs the generation in its high half, the RMW returns the generation and the slot atomically, and a
+lane can never pair a slot index with the wrong block. Only the unique lane that receives slot \code{cap} grows the
+vertex. Lanes that overshoot wait (with \code{\_\_nanosleep}) and retry. This wait is bounded by one
+\code{allocBlock} under independent thread scheduling. The RMW must be \emph{acq\_rel}: defect D8
+(\S\ref{sec:defects}) showed that a relaxed reservation leaves no happens-before edge to the grower's publication
+of the new generation.
+
+\begin{algorithm}[t]
+\caption{Warp-cooperative slot reservation}
+\label{alg:resv}
+\KwIn{vertex $u$ for lanes that need a slot}
+$grp \leftarrow$ \code{\_\_match\_any\_sync}(FULL, $u$)\;
+\If{lane is leader of $grp$}{ $w \leftarrow$ \code{vfill}$[u]$.\code{fetch\_add}(popc($grp$), acq\_rel) }
+broadcast $w$; $s \leftarrow \mathrm{low}(w) + \mathrm{rank}(lane, grp)$; $g \leftarrow \mathrm{high}(w)$\;
+\uIf{$g = \textsc{none} \wedge s = 0$}{\code{allocBlock}$(u,\textsc{none})$ \tcp*{unique creator}}
+\uElseIf{$s < \mathrm{cap}(g)$}{\Return $(g, \mathrm{base}(g)+s)$}
+\uElseIf{$s = \mathrm{cap}(g)$}{\code{allocBlock}$(u, g)$ \tcp*{unique grower}}
+\Else{wait (\code{\_\_nanosleep}); retry}
+\BlankLine
+\textbf{allocBlock}$(u, old)$: $B[new] \leftarrow \{base, cap \ll 3, nch, chBase, prevGen{=}old\}$; fence\;
+\quad \code{vcur}$[u] \leftarrow new$ (release); \code{vfill}$[u] \leftarrow (new \ll 32)\,|\,0$ (release)\;
+\end{algorithm}
+
+\subsection{Destination-precise conflict detection}
+GTX detects write-write conflicts at the granularity of a delta chain: a writer aborts if the chain's newest live
+delta is not visible to it, whichever destination that delta belongs to. With many destinations hashed onto few
+chains and large transactions, most of these aborts are \emph{false}. \sys{} checks only versions of the same
+destination (Algorithm~\ref{alg:write}), and it guarantees exclusion by validating and installing against the
+\emph{same} observed head $h_0$. If the CAS fails, only the new prefix $h_1 .. h_0$ is walked, and any non-aborted
+foreign version of $v$ in it aborts the writer. The walk applies first-updater-wins: an \textsc{active} foreign
+version aborts with \code{WW\_PENDING}, and a version committed after $rts$ aborts with \code{WW\_LATE}. The
+GTX-faithful rule remains available (\code{dstconf=0}) for ablation and reports its extra aborts as
+\code{AB\_CHAIN\_FALSE}.
+
+\begin{algorithm}[t]
+\caption{Write (insert/delete) of edge $(u,v)$ by $T$}
+\label{alg:write}
+$(g, slot) \leftarrow$ \code{reserveSlot}$(u)$\;
+$h_0 \leftarrow H[\mathrm{head}(g,v)]$.load(acquire)\;
+\lIf{$h_0$.SEAL}{void($slot$); retry reservation}
+$r \leftarrow$ \code{walkGens}$(g, h_0, v, \mathit{seal}{=}\mathit{true})$ \tcp*{newest version of $v$}
+\ForEach{delta $d$ of $v$ met newest-first}{
+  \lIf{$d$.owner $= T$}{found}
+  \lElseIf{aborted}{skip}
+  \lElseIf{active}{abort(\code{WW\_PENDING})}
+  \lElseIf{committed $> rts$}{abort(\code{WW\_LATE})}
+  \lElse{found}
+}
+decide effective / no-op from $r$; on no-op or abort: void($slot$)\;
+write delta $\{dstop, prev{=}h_0, owner{=}T\}$\;
+\While{$\neg$CAS$(H[\mathrm{head}(g,v)], h_0 \rightarrow slot)$ (acq\_rel)}{
+  $h_1 \leftarrow$ observed head\;
+  \lIf{$h_1$.SEAL}{void($slot$); retry reservation}
+  \lIf{a non-aborted foreign version of $v$ lies in $h_1 .. h_0$}{void($slot$); abort}
+  $prev \leftarrow h_1$; $h_0 \leftarrow h_1$\;
+}
+\lIf{op $=$ DEL}{its(superseded) $\leftarrow$ TAG$|T$}
+\end{algorithm}
+
+\subsection{Group commit with epochs}
+GTX's group commit uses global read and write epochs. On the GPU, the obvious registration protocol (read \code{E},
+increment an in-flight counter, re-read \code{E}, retry on change) \emph{livelocked} for seconds, because the
+advancer bumps the epoch about once per microsecond (defect D5). \sys{} makes registration a single RMW
+(Algorithm~\ref{alg:commit}). \code{E} packs the open epoch with the number of writers registered in it, so a warp's
+leader registers all its committing lanes with one \code{fetch\_add} and receives the epoch in the same instruction.
+The advancer closes an epoch with one \code{exchange}, which atomically returns the exact number of registered writers,
+waits until \code{done[e\&1]} reaches that count, and only then publishes $\code{frontier} := e$ with a release
+store. Readers take snapshots with one acquire load. After commit, lanes lazily stamp \code{cts} on their deltas and
+\code{its} on superseded versions, so later readers skip the descriptor lookup.
+
+A transaction that performed no effective write commits at $cts = rts$ without registering. It publishes
+\textsc{aborted} rather than \textsc{committed} because it may own reserved-then-voided slots, which must never
+become ``committed in the past'' (defect D7).
+
+\begin{algorithm}[t]
+\caption{Commit (per warp) and the advancer}
+\label{alg:commit}
+$W \leftarrow$ lanes alive with $\ge 1$ effective write\;
+$e \leftarrow$ \code{E}.\code{fetch\_add}(popc($W$), acq\_rel) $\gg 32$ \tcp*{leader; before validation}
+\If{SER}{
+  validate point reads: newest non-aborted foreign version of $(u,v)$ is the observed one\;
+  validate scans: every foreign non-aborted delta of $u$ visible at $rts$ and not invalidated\;
+}
+fence; \code{desc}$[T] \leftarrow$ alive ? \textsc{committed}$(e)$ : \textsc{aborted}; \code{\_\_syncwarp}\;
+leader: fence; \code{done}$[e \,\&\, 1]$ += popc($W$)\;
+stamp: cts(own deltas) $\leftarrow e$; its(superseded) $\leftarrow e$\;
+\BlankLine
+\textbf{advancer} (one lane)\;
+\While{true}{
+  $e \leftarrow$ \code{E}.hi; $reg \leftarrow$ \code{E}.\code{exchange}$((e{+}1) \ll 32)$.lo\;
+  wait \code{done}$[e\,\&\,1] = reg$; \code{done}$[e\,\&\,1] \leftarrow 0$; \code{frontier} $\leftarrow e$ (release)\;
+}
+\end{algorithm}
+
+\subsection{Serializable mode}
+SI permits write skew. \sys{}'s SER mode adds optimistic read validation at commit. For a point read or a no-op
+write, the newest non-aborted foreign version of $(u,v)$ must still be the one observed. For a scan, every foreign,
+non-aborted delta of $u$ must be visible at $rts$ and not invalidated by a non-aborted foreign transaction; this is
+a predicate (phantom) check. The ordering matters. In our first design the epoch was taken \emph{after} validation,
+so an rw anti-dependency $T \rightarrow U$ could run backwards in commit order, and read-only transactions reading
+from the frontier saw non-serializable states (defect D6, 5 histories with up to 40,535 serialization-graph back
+edges). Fixing the epoch \emph{before} validation (Silo order~\cite{silo}) makes every ww, wr and rw dependency
+non-decreasing in commit epoch. A frontier snapshot is then a dependency-closed prefix, and read-only transactions
+serialize at $rts$ with no validation at all.
+
+\subsection{Reads and scans}
+\textsc{lookup} walks the chain(s) of $v$ from \code{vcur[u]} newest-first and returns the first version visible to
+$T$. \textsc{scan} visits every slot $[0, \min(\mathit{fill}, \mathit{cap}))$ of every generation. By default the
+whole warp strides one vertex (warp-cooperative scan), which is essential for power-law graphs
+(\S\ref{sec:readers}). Readers never write shared state, never wait, and never abort in SI mode.
+
+\subsection{Cost model}
+Table~\ref{tab:cost} gives the uncontended cost of one effective write. The dominant fixed cost compared with a
+lock-based hash table is versioning: a 32-byte delta, a chain head and descriptor/epoch bookkeeping per attempt.
+Scans cost $\Theta$(slots in all generations), including aborted and voided slots until reclamation, which is
+specified but not implemented (\S\ref{sec:limits}).
+
+\begin{table}[t]
+\caption{Cost per effective write (uncontended).}
+\label{tab:cost}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}P{1.5cm}P{3.7cm}P{2.4cm}@{}}
+\toprule
+Step & Dependent global round trips & Atomics \\
+\midrule
+reservation & 1 RMW on \code{vfill[u]} (+1 load of $B[g]$) & 1 per (warp, vertex) \\
+walk & 1 + chain length ($\approx$1) + 1 per older gen. & 1 seal per (old gen, chain) \\
+install & 1 CAS & 1 \\
+commit & 1 RMW on \code{E}, 1 on \code{done} per warp; per lane 1 desc store + stamps & 2 per warp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ===================================================================================================================
+\section{Correctness}
+\label{sec:correct}
+
+\subsection{Invariants}
+\label{sec:inv}
+\begin{description}
+\item[I1 Single writer per chain position.] For every key, non-aborted versions are totally ordered by chain
+position, and that order equals commit-epoch order. This follows from three rules: an install requires the newest
+non-aborted version to be $T$'s own or committed $\le rts$; the CAS is on the same observed head; and a failed CAS
+triggers a prefix re-walk.
+\item[I2 Generation monotonicity.] If a version of $v$ exists in generation $g{+}1$, the head of $v$'s chain in every
+older generation is sealed, so every install into $g$ precedes every install into $g{+}1$ for that key.
+\item[I3 Frontier safety.] $\code{frontier} \ge e$ implies that every writer registered in $e$ has published its final
+descriptor. Registration and closing are RMWs on one word, and the advancer waits for the exact count.
+\item[I4 No torn visibility.] A transaction's versions become visible to a snapshot all-or-nothing, because
+visibility depends only on the descriptor or epoch and snapshots cover only completed epochs.
+\item[I5 SER ordering.] A writer's epoch is fixed before its validation, so every dependency is non-decreasing in
+epoch.
+\item[I6 Slot publication.] Every reserved slot is written exactly once by its reserver (content, or \textsc{void}),
+and a slot is linked into a chain at most once.
+\end{description}
+
+\paragraph{Memory-order requirements.} Each of the following was shown necessary either by a failure or by the
+memory model. (1) The grower's stores $B[new] \rightarrow \code{vcur} \rightarrow \code{vfill}$ are releases, and the
+reservation \code{fetch\_add} is acq\_rel. (2) The delta contents reach the chain head through an acq\_rel CAS, whose
+release sequence covers later readers. (3) Relaxed loads of delta contents suffice for scanners, because a scanner
+uses a delta only after establishing its creator's visibility through \code{desc} or \code{frontier} (acquire).
+(4) Commit publication is: fence; relaxed descriptor store; \code{\_\_syncwarp}; leader fence; RMW on \code{done};
+acquire load by the advancer; release store of the frontier.
+
+\paragraph{Progress.} Writers are lock-free per operation, since a CAS failure implies another install succeeded.
+Aborts are no-wait (first-updater-wins). Livelock under identical-edge contention is possible in principle and is
+mitigated by randomized exponential backoff. Commit registration is wait-free. The advancer waits only for registered
+committers, so in SER mode the frontier's staleness is bounded by the longest validation.
+
+\subsection{History checker}
+\label{sec:checker}
+A final-state comparison (``the logged edge set equals the device's edge set'') cannot detect a lost update between two
+deletions, a torn snapshot, or a dirty read that is later overwritten. Our audit of an earlier GPU prototype found all
+three, and each passed that check. \sys{} is instead validated by a host-side checker over the full history. Let
+$S(e)$ be the graph after applying, in $cts$ order, the net writes of all committed transactions with $cts \le e$.
+\begin{description}
+\item[C1 Read rule.] Every read, no-op write and scan result equals $S(rts)$ overlaid with $T$'s own earlier writes;
+effective writes agree with the same state.
+\item[C2 Observation identity.] A point read names exactly the delta the rule predicts, never an aborted or
+uncommitted one.
+\item[C3 Write-write.] No committed writer of key $k$ has $cts \in (rts(T), cts(T))$ for another writer $T$ of $k$,
+and no two writers of $k$ share a commit timestamp.
+\item[C4 Final state.] The device's final edge set equals $S(\infty)$.
+\item[C5 Serialization graph] (SER). The direct serialization graph (ww, wr, rw edges; per-key version order $=$ cts
+order; a scan reads every key of its vertex) is acyclic.
+\end{description}
+
+\paragraph{Test suite.} Six adversarial workloads (mixed uniform on 256 vertices, 50\% hub mixed, 8 identical hot
+edges, delete/re-insert churn on 64 vertices with $K{=}8$, 30\% hub with $K{=}32$, Zipf with 50\% readers) run in eight
+configurations spanning SI/SER, cooperative reservation on/off, destination/chain conflict granularity, and
+per-lane/cooperative scans. All 48 histories pass C1--C5. A \emph{write-skew probe} must show the anomaly under SI
+and must not show it under SER: SI produced 16,000 serialization-graph back edges, SER produced 0, and both pass their
+respective checks. A tiny-arena test forces resource exhaustion; the committed prefix remains consistent at every arena
+size. Every benchmark configuration in \S\ref{sec:eval} also passes the checker in a reduced-size run, and so do all
+baselines in SER mode.
+
+\paragraph{Mutation testing.} To show the checker is sensitive, three broken protocols are compiled in
+(Table~\ref{tab:mut}). The checker rejects all three. The prototype-style final-state check accepts two of them.
+
+\begin{table}[t]
+\caption{Mutation tests: violations reported by each check.}
+\label{tab:mut}
+\footnotesize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}lP{1.45cm}P{4.3cm}@{}}
+\toprule
+Mutation & Final-state check & History checker \\
+\midrule
+no ww check & passes (0/0) & 4,386 C3; 10,984 same-epoch writers; 11,507 extra final edges; 6,557 DSG back edges \\
+ignore snapshot & passes (0/0) & 9,658 wrong reads; 5,382 wrong scans; 301,431 DSG back edges \\
+dirty reads & 1,133/340 & 11,411 wrong reads; 6,972 wrong scans; 271,175 DSG back edges \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Defects found during development}
+\label{sec:defects}
+Table~\ref{tab:defects} lists the protocol defects found by the checker, by stress tests or by memory-model reasoning.
+All were found and fixed \emph{before} any benchmark in \S\ref{sec:eval} was recorded. D9 teaches a general lesson: a
+diagnostic mechanism (a watchdog) must never trade safety for liveness.
+
+\begin{table*}[t]
+\caption{Protocol defects found and fixed before benchmarking.}
+\label{tab:defects}
+\footnotesize
+\begin{tabular}{@{}lP{2.6cm}P{4.3cm}P{4.2cm}P{3.5cm}@{}}
+\toprule
+Id & Detected by & Root cause & Fix & Evidence after fix \\
+\midrule
+D5 & 180-rep stress + watchdog & register by read-increment-reread of \code{E}; advancer bumps \code{E} $\approx$1/\textmu s $\Rightarrow$ committer starves (1.5--20 s kernels) & wait-free registration: one \code{fetch\_add} on \code{(epoch<<32|count)}; close by \code{exchange} & 180/180 reps in 0.15--1.0 ms \\
+D6 & checker C5 & epoch fixed after read validation; rw edge runs backwards in commit order (1--40,535 back edges) & Silo order: register epoch before validation & 0 cycles in all SER histories \\
+D7 & reasoning (C1 risk) & read-only commit at $cts{=}rts$ would expose voided slots as committed in the past & read-only commit publishes \textsc{aborted} & suite and check matrix pass \\
+D8 & forensic scan instrumentation & relaxed reservation RMW: no happens-before to the grower's generation publication & reservation RMW acq\_rel & memory-order argument; suite pass \\
+D9 & checker C1 + decision codes & harness watchdog left the advancer's wait after 20 s and published the frontier early & watchdog only flags; run declared invalid; publishing stops & 4/4 stress iterations and 48 histories pass \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+%% ===================================================================================================================
+\section{Evaluation}
+\label{sec:eval}
+
+\subsection{Setup}
+\label{sec:setup}
+\paragraph{Platform.} NVIDIA RTX~4060 Laptop GPU (Ada, sm\_89, 24 SMs, 8~GB, WDDM), CUDA~12.8, Windows~11, compiled
+with \code{nvcc -O3 -arch=sm\_89}.
+
+\paragraph{Systems.} All transactional baselines share one storage layout: per-vertex open-addressing hash adjacency
+plus a per-vertex degree word, pre-sized from the workload so that, unlike \sys{}, they never pay for growth.
+\begin{itemize}
+\item \textbf{2PL}: strict two-phase locking with per-vertex reader-writer spinlocks acquired in sorted vertex order
+(deadlock-free).
+\item \textbf{TL2 STM}: word-based TL2-style STM~\cite{tl2} (global version clock, versioned lock records, lazy write
+buffering, commit-time sorted locking, read-set validation; read-only transactions without read sets).
+\item \textbf{TL2 STM, no degree}: the same without the degree word. It avoids the hub hot spot but cannot answer
+degree queries transactionally.
+\item \textbf{Non-transactional CAS}: SlabGraph/faimGraph-style lock-free updates. It provides no atomicity or
+snapshots and serves as a lower bound on synchronization cost.
+\item \textbf{GTX-conservative}: \sys{} with per-lane reservation and GTX's chain-granularity conflicts, i.e.\ the
+closest port of GTX.
+\item \textbf{GPMA+}~\cite{gpma}: the authors' implementation, both a Windows port and the pristine upstream build
+(within 2\% of each other).
+\end{itemize}
+
+\paragraph{Workloads.} A deterministic generator (splitmix64, seed 1) produces one stream that every system consumes.
+$|V| = 2^{20}$, the initial graph has 4M edges, and each run has about 1M operations
+($2^{20}/K$ transactions of $K$ operations, or $2^{18}$ transactions with $K{=}4$). Sources are uniform, hub
+(a fraction of operations on one vertex), Zipf($s{=}1$) or R-MAT. Mixes include inserts, deletes, churn
+(50/50 insert/delete), reads, identical-edge contention, and 50\% or 90\% read-only transactions with 10\% scans.
+
+\paragraph{Methodology.} We time the single transactional kernel with CUDA events; initial loading and checking are
+excluded. Each (scenario, system) runs in its own process with one warm-up and five measured repetitions, and a 90~s
+timeout is recorded as DNF. We report committed transactions/s and \emph{effective} edge changes/s (never attempted
+operations). Speedup is the ratio of median committed throughput, with a 95\% bootstrap confidence interval over
+repetitions. Latency is measured per transaction with \code{\%globaltimer} from the first attempt to commit, including
+retries.
+
+\subsection{Update throughput and transaction size}
+Figures~\ref{fig:ksweep-u} and~\ref{fig:ksweep-h} vary the transaction size $K$ for insert-only workloads. On
+\emph{uniform} sources (Figure~\ref{fig:ksweep-u}), conflicts are rare and uncontended vertex locks are cheap, so 2PL is
+1.3--2.0$\times$ faster than \sys{} up to $K{=}8$. That gap is the fixed cost of versioning (\S\ref{sec:losses}). As
+$K$ grows, lock and read-set footprints grow with it. At $K{=}32$, \sys{} sustains 141~M effective edges/s while 2PL
+drops to 91~M ($1.55\times$), TL2 to 1.8~M ($77\times$), and the conservative GTX port to 79~M, because its
+chain-granularity rule aborts 45\% of attempts.
+
+With a \emph{hub} receiving 50\% of operations (Figure~\ref{fig:ksweep-h}), 2PL does not finish any $K$ within 90~s, and
+TL2 collapses to 0.015--1.0~M edges/s with abort ratios above 99.6\% because every insert conflicts on the hub's degree
+word. \sys{} stays at 74--142~M edges/s. Only the degree-free STM is competitive at small $K$ (0.76--1.21$\times$ of
+\sys{}); at $K{=}32$ it aborts 90\% of attempts and \sys{} is $4.1\times$ faster.
+
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=\columnwidth, height=5.0cm,
+    xmode=log, log basis x=2, xtick={1,2,4,8,32}, xticklabels={1,2,4,8,32},
+    ymode=log, grid=major, grid style={black!10},
+    xlabel={transaction size $K$}, ylabel={effective edges/s (M)},
+    tick label style={font=\scriptsize}, label style={font=\footnotesize},
+    legend style={font=\tiny, at={(0.5,1.03)}, anchor=south, legend columns=3, draw=none, fill=none}, ymin=1, ymax=900,
+    ytick={1,10,100,1000}, yticklabels={1,10,100,1000}]
+\addplot[cGTX, mark=*] coordinates {(1,181.4)(2,166.7)(4,175.3)(8,164.7)(32,140.9)}; \addlegendentry{\sys{}}
+\addplot[cCONS, mark=o, dashed] coordinates {(1,175.0)(2,164.8)(4,165.7)(8,147.8)(32,78.5)}; \addlegendentry{GTX-conservative}
+\addplot[cTPL, mark=square*] coordinates {(1,343.3)(2,333.8)(4,274.0)(8,215.8)(32,91.0)}; \addlegendentry{2PL}
+\addplot[cSTM, mark=triangle*] coordinates {(1,158.8)(2,124.8)(4,67.8)(8,23.0)(32,1.83)}; \addlegendentry{TL2 STM}
+\addplot[cNOD, mark=diamond*] coordinates {(1,264.6)(2,196.1)(4,179.6)(8,113.5)(32,12.3)}; \addlegendentry{TL2 STM (no degree)}
+\addplot[cCAS, mark=x, densely dotted] coordinates {(1,447.0)(2,500.0)(4,521.1)(8,493.0)(32,477.6)}; \addlegendentry{CAS (non-txn)}
+\end{axis}
+\end{tikzpicture}
+\caption{Uniform inserts: effective edge insertions per second vs.\ transaction size ($|V|{=}2^{20}$, 4M initial edges,
+1M operations).}
+\label{fig:ksweep-u}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=\columnwidth, height=5.0cm,
+    xmode=log, log basis x=2, xtick={1,2,4,8,32}, xticklabels={1,2,4,8,32},
+    ymode=log, grid=major, grid style={black!10},
+    xlabel={transaction size $K$}, ylabel={effective edges/s (M)},
+    tick label style={font=\scriptsize}, label style={font=\footnotesize},
+    legend style={font=\tiny, at={(0.5,1.03)}, anchor=south, legend columns=3, draw=none, fill=none}, ymin=0.01, ymax=900,
+    ytick={0.01,0.1,1,10,100,1000}, yticklabels={0.01,0.1,1,10,100,1000}]
+\addplot[cGTX, mark=*] coordinates {(1,134.7)(2,141.5)(4,138.8)(8,127.3)(32,73.9)}; \addlegendentry{\sys{}}
+\addplot[cCONS, mark=o, dashed] coordinates {(1,125.5)(2,129.1)(4,123.7)(8,99.5)(32,55.6)}; \addlegendentry{GTX-conservative}
+\addplot[cSTM, mark=triangle*] coordinates {(1,1.029)(2,0.754)(4,0.528)(8,0.2006)(32,0.01524)}; \addlegendentry{TL2 STM}
+\addplot[cNOD, mark=diamond*] coordinates {(1,176.8)(2,144.5)(4,151.2)(8,105.5)(32,18.07)}; \addlegendentry{TL2 STM (no degree)}
+\addplot[cCAS, mark=x, densely dotted] coordinates {(1,297.8)(2,330.1)(4,346.9)(8,332.9)(32,325.9)}; \addlegendentry{CAS (non-txn)}
+\end{axis}
+\end{tikzpicture}
+\caption{50\% hub inserts. 2PL did not finish any $K$ within 90~s (lower-bound speedups of \sys{}:
+$>$11,000$\times$).}
+\label{fig:ksweep-h}
+\end{figure}
+
+\subsection{Contention, skew and headline comparison}
+Figure~\ref{fig:headline} summarizes \sys{}'s speedup over each transactional baseline across the scenarios where
+synchronization is hard, together with the uncontended $K{=}1$ case for reference. On power-law churn
+(insert/delete mixes, $K{=}4$), 2PL serializes on hub locks: \sys{} is 525$\times$ faster on R-MAT, and 2PL does
+not finish on Zipf. TL2 is 101--364$\times$ slower. The degree-free STM matches \sys{} (0.89--0.96$\times$) in
+write-only churn. It loses once readers or large transactions appear.
+
+Under \emph{identical-edge contention} (50\% of operations on 64 or 1,024 hot edges), every system is dominated by
+true conflicts. \sys{} is still 4.6--12.3$\times$ faster than the transactional baselines, because
+first-updater-wins with no-wait aborts and backoff wastes less work than lock waits or commit-time validation
+failures.
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\textwidth, height=5.6cm, ybar, bar width=5pt, ymode=log, log origin=infty,
+  ymin=0.3, ymax=60000, xmin=0.4, xmax=12.6,
+  xtick={1,...,12}, xticklabels={
+    {R-MAT\\90\% readers}, {Zipf\\50\% readers}, {SER Zipf\\(checked)}, {SER 50\% hub\\(checked)},
+    {R-MAT churn\\$K{=}4$}, {Zipf churn\\$K{=}4$}, {1,024 hot\\edges}, {64 hot\\edges},
+    {uniform ins.\\$K{=}32$}, {50\% hub ins.\\$K{=}32$}, {50\% hub ins.\\$K{=}1$}, {uniform ins.\\$K{=}1$}},
+  xticklabel style={align=center, font=\tiny}, tick label style={font=\scriptsize},
+  ylabel={speedup of \sys{} (log)}, label style={font=\footnotesize},
+  ymajorgrids, grid style={black!10},
+  legend style={font=\scriptsize, at={(0.5,1.02)}, anchor=south, legend columns=4, draw=none}
+]
+\addplot[fill=cTPL, draw=none, bar shift=-5.5pt] coordinates {
+  (1,13.96) +- (0,0) (3,652.07) (4,59.47) (5,524.73) (7,9.31) (8,4.57) (9,1.55) (12,0.53)};
+\addlegendentry{vs 2PL}
+\addplot[fill=cSTM, draw=none, bar shift=0pt] coordinates {
+  (1,22.65) (2,8.51) (3,118.55) (4,23.25) (5,101.30) (6,363.90) (7,12.29) (8,2.48) (9,77.15) (10,4711.42) (11,126.83) (12,1.14)};
+\addlegendentry{vs TL2 STM}
+\addplot[fill=cNOD, draw=none, bar shift=5.5pt] coordinates {
+  (1,16.69) (2,2.53) (3,20.24) (4,10.16) (5,0.96) (6,0.89) (7,10.25) (8,2.59) (9,11.45) (10,4.09) (11,0.76) (12,0.69)};
+\addlegendentry{vs TL2 STM (no degree)}
+\addplot[pattern=north east lines, pattern color=cTPL, draw=cTPL, bar shift=-5.5pt] coordinates {
+  (2,205) (6,11903) (10,11373) (11,20690)};
+\addlegendentry{vs 2PL: DNF (lower bound)}
+\draw[black!60, dashed] (axis cs:0.4,1) -- (axis cs:12.6,1);
+\end{axis}
+\end{tikzpicture}
+\caption{Speedup of \sys{} in committed transactions/s over each transactional baseline ($>1$: \sys{} faster). Hatched
+bars: 2PL did not finish within the timeout; the bar is a lower bound that assumes 2PL would have committed everything
+at the timeout. Reader scenarios use each baseline's best scan mode. SER scenarios are the checked configurations
+($|V|{=}2^{16}$).}
+\label{fig:headline}
+\end{figure*}
+
+\subsection{Concurrent snapshot readers}
+\label{sec:readers}
+Readers are where multi-versioning pays off most. In R-MAT with 90\% read-only transactions (10\% of their operations
+are adjacency scans), \sys{} readers never block writers, never abort and never wait. \sys{} commits 17.3~M
+transactions/s with an overall abort ratio of 0.03\%, compared with 90\% for TL2. Each baseline was run in two modes,
+per-lane scans and warp-cooperative read-only scans identical in structure to \sys{}'s, and every headline number uses
+the baseline's \emph{better} mode. \sys{} is 14.0$\times$, 22.7$\times$ and 16.7$\times$ faster than 2PL, TL2 and
+degree-free TL2. Figure~\ref{fig:latency} shows read-only tail latency: a p99 of 2.4--2.5~ms for \sys{} versus
+57--459~ms for the transactional baselines. Under Zipf with 50\% readers, 2PL does not finish in either mode, and
+\sys{} is 8.5$\times$ faster than TL2 and 2.5$\times$ faster than degree-free TL2.
+
+Cooperative scanning is required, though. With per-lane scans, \sys{} takes 2,577~ms on Zipf readers, versus 438~ms
+with warp scans, because a scan reads every 32-byte version, including aborted and voided slots.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\columnwidth, height=4.9cm, ybar, bar width=7pt, ymode=log, log origin=infty,
+  ymin=1, ymax=1000, symbolic x coords={GTX,2PL,TL2,TL2nd,CAS}, xtick=data,
+  xticklabels={\sys{}, 2PL, TL2 STM, {TL2 STM\\(no deg.)}, {CAS\\(non-txn)}},
+  xticklabel style={align=center, font=\tiny}, tick label style={font=\scriptsize},
+  ylabel={read-only p99 latency (ms)}, label style={font=\footnotesize},
+  ymajorgrids, grid style={black!10}, enlarge x limits=0.15,
+  legend style={font=\tiny, at={(0.5,1.02)}, anchor=south, legend columns=2, draw=none},
+  nodes near coords, nodes near coords style={font=\tiny, rotate=90, anchor=west},
+  point meta=explicit symbolic]
+\addplot[fill=cGTX!80, draw=none] coordinates {(GTX,2.42)[2.4] (2PL,458.9)[459] (TL2,209.9)[210] (TL2nd,82.8)[83] (CAS,18.8)[19]};
+\addlegendentry{per-lane scans}
+\addplot[fill=cCONS, draw=none] coordinates {(GTX,2.49)[2.5] (2PL,57.3)[57] (TL2,328.3)[328] (TL2nd,238.3)[238] (CAS,1.71)[1.7]};
+\addlegendentry{cooperative read-only scans}
+\end{axis}
+\end{tikzpicture}
+\caption{Read-only transaction p99 latency, R-MAT with 90\% readers, $K{=}4$. \sys{} scans cooperatively in both
+bars; the modes refer to the baselines.}
+\label{fig:latency}
+\end{figure}
+
+\subsection{Serializable transactions}
+In SER mode with 20\% read-only transactions and point reads inside update transactions (checked configuration,
+$|V|{=}2^{16}$), \sys{} is 652$\times$, 119$\times$ and 20$\times$ faster than 2PL, TL2 and degree-free TL2 on Zipf,
+and 59$\times$, 23$\times$ and 10$\times$ faster on a 50\% hub. Every system passes C1--C5 on these runs. At full size
+($|V|{=}2^{20}$, read-write $K{=}4$), SER costs \sys{} 10--17\% throughput relative to SI (e.g.\ 46.0~M vs 50.9~M
+transactions/s on uniform). 2PL does not finish on the hub and is 1,471$\times$ slower on Zipf. On uniform
+read-write, SER \sys{} reaches 0.62$\times$ of 2PL and 2.26$\times$ of TL2.
+
+\subsection{Comparison with GPMA+}
+GPMA+ applies a sorted batch as one unit and offers no multi-edge transactions or concurrent readers. We fed it the
+exact $K{=}1$ streams used for \sys{} (Table~\ref{tab:gpma}). \sys{} commits every operation as its own transaction
+and is still 8.6--14.6$\times$ faster than GPMA+ with 524K-edge batches and 10--20$\times$ with 65K-edge batches.
+GPMA+ also loses intra-batch operation order, so on hub and churn streams (duplicates, or insert and delete of one
+edge within a batch) its final state differs from sequential semantics.
+
+\begin{table}[t]
+\caption{GPMA+ vs.\ \sys{} on identical $K{=}1$ streams (effective edges/s; GPMA+ Windows port).}
+\label{tab:gpma}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Stream & \multicolumn{2}{c}{GPMA+ batch} & \sys{} & Speedup \\
+ & 65,536 & 524,288 & (txn) & (65K / 524K) \\
+\midrule
+uniform insert & 9.03 M & 12.61 M & 181.4 M & 20.1 / 14.4$\times$ \\
+uniform churn & 15.26 M & 17.98 M & 155.7 M & 10.2 / 8.7$\times$ \\
+R-MAT churn & 15.32 M & 19.04 M & 143.8 M & 9.4 / 7.6$\times$ \\
+50\% hub insert & 8.43 M & 10.45 M & 134.7 M & 16.0 / 12.9$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablation and design hypotheses}
+\label{sec:ablation}
+Each GPU mechanism was stated with a falsification criterion before measurement (Table~\ref{tab:hyp}).
+
+\textbf{M1: cooperative reservation} (\code{gtx} vs \code{gtx-dst-only}, identical except \code{coop}). The
+hypothesis was a $\ge$10\% gain on hub workloads. Measured gains were +8.6\% and +11.0\% on 50\% hub at $K{=}1$ and
+$K{=}8$, +6.0\% and +5.8\% on 100\% hub, and +3.4\% on uniform $K{=}8$. Three of the four hub cells are below
+threshold, so M1 is \emph{falsified as a primary mechanism}. Same-address RMWs on Ada's L2 are not the hub bottleneck.
+It is kept as a small win that was never negative.
+
+\textbf{M1b: destination-precise conflicts} (\code{gtx} vs \code{gtx-coop-only} and \code{gtx-cons}). This is
+\emph{supported}. Figure~\ref{fig:aborts} shows the abort ratio: chain-granularity aborts grow with $K$ to 45\%
+(uniform) and 43\% (hub) at $K{=}32$, while destination-precise detection has zero aborts on uniform and 26\% on the
+hub (true conflicts). Throughput improves $\times$1.14 at uniform $K{=}8$ (isolated effect), and $\times$1.80
+(uniform) and $\times$1.33 (hub) at $K{=}32$ over the conservative port.
+
+\textbf{M3: epoch commit groups.} \emph{Not falsified.} Commit takes 9.6\% (4M-edge initial graph) to 15.5\% (empty
+graph) of the lane-cycle profile for uniform $K{=}1$ inserts, below the 25\% threshold, and all histories pass.
+
+Two micro-optimizations were also falsified: padding hot counters onto separate cache lines (no gain, reverted), and
+relaxed versus acq\_rel reservation RMW (no measurable difference, so the fence required by D8 is free here).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\columnwidth, height=4.6cm,
+  xmode=log, log basis x=2, xtick={1,2,4,8,32}, xticklabels={1,2,4,8,32},
+  ymin=0, ymax=50, grid=major, grid style={black!10},
+  xlabel={transaction size $K$}, ylabel={abort ratio (\%)},
+  tick label style={font=\scriptsize}, label style={font=\footnotesize},
+  legend style={font=\tiny, at={(0.02,0.98)}, anchor=north west, draw=none, fill=white, fill opacity=0.8, text opacity=1}]
+\addplot[cCONS, mark=o, dashed] coordinates {(1,0.16)(2,0.64)(4,2.47)(8,8.54)(32,45.4)}; \addlegendentry{chain-granularity, uniform}
+\addplot[cGTX, mark=*] coordinates {(1,0)(2,0)(4,0)(8,0)(32,0)}; \addlegendentry{destination-precise, uniform}
+\addplot[cTPL!70, mark=square, dashed] coordinates {(1,0.11)(2,0.46)(4,1.79)(8,6.52)(32,42.5)}; \addlegendentry{chain-granularity, 50\% hub}
+\addplot[cTPL, mark=square*] coordinates {(1,0.05)(2,0.20)(4,0.74)(8,2.73)(32,25.9)}; \addlegendentry{destination-precise, 50\% hub}
+\end{axis}
+\end{tikzpicture}
+\caption{Abort ratio under GTX's chain-granularity rule (GTX-conservative) and \sys{}'s destination-precise
+validate-then-CAS (insert-only workloads).}
+\label{fig:aborts}
+\end{figure}
+
+\begin{table}[t]
+\caption{Design hypotheses and outcomes.}
+\label{tab:hyp}
+\footnotesize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}P{2.3cm}P{3.2cm}P{2.0cm}@{}}
+\toprule
+Method & Falsified if & Outcome \\
+\midrule
+M1 cooperative reservation & $<$10\% gain on hub, $K\in\{1,8\}$ & falsified (+3.4--11\%) \\
+M1b destination-precise conflicts & $<$10\% gain at $K\ge 8$ or any checker failure & supported \\
+M2 multiple reservation regions & $<$10\% gain on 100\% hub & not built (ranked low after M1) \\
+M3 epoch commit groups & commit $>$25\% of cycles, or C1--C5 failure & not falsified (9.6--15.5\%) \\
+M4 reclamation by generation & $>$20\% throughput cost & specified, not built \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Where \sys{} loses}
+\label{sec:losses}
+Table~\ref{tab:losses} lists every scenario in which \sys{} is slower. The uncontended gap to 2PL has no single
+hotspot. The engine skeleton alone (about 3.3~ms per 1M operations) takes as long as 2PL's entire run. Closing the gap
+requires fewer bytes per version and cheaper per-attempt bookkeeping.
+
+\begin{table}[t]
+\caption{Scenarios where \sys{} is slower (\sys{} / baseline throughput).}
+\label{tab:losses}
+\footnotesize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}P{2.6cm}P{1.1cm}P{4.0cm}@{}}
+\toprule
+Scenario & Ratio & Reason \\
+\midrule
+uniform ins./churn/del., $K\le 8$, vs 2PL & 0.47--0.76 & versioning cost (32 B delta, chain head, descriptor/epoch); uncontended locks are cheap \\
+write-only contention vs TL2 without degree word & 0.64--0.98 & hash-slot writes rarely conflict without a degree word; this STM cannot serve degree queries and collapses with scans \\
+any scenario vs non-txn CAS & 0.10--0.45 & CAS offers no atomicity or snapshots \\
+memory & 2.5--20$\times$ larger & aborted and voided deltas never reclaimed (e.g.\ 1.5 GB vs 77 MB, 64 hot edges) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Threats to validity}
+The baselines' hash tables are pre-sized and never grow, which favours them. Scans were compared in both per-lane
+and cooperative modes, and the better mode of each baseline is reported. DNF lower bounds assume the baseline would
+have finished at the timeout. Literature numbers (TITAN~V, P100, 2080~Ti, other datasets) are used only as reference
+points and never as head-to-head claims. All experiments use synthetic generators on one laptop GPU under WDDM. Real
+SNAP graphs and batch-size sweeps are future work.
+
+%% ===================================================================================================================
+\section{Limitations and Future Work}
+\label{sec:limits}
+\begin{enumerate}
+\item \textbf{Reclamation and consolidation by generation (M4).} A generation becomes reclaimable when it is sealed for
+all chains, every delta in it is superseded at an epoch $\le$ \code{minActiveRts} (or aborted or voided), and no
+reader with $rts <$ its retire epoch is active. Protection is tracked per generation rather than per delta. Live
+latest versions are consolidated into a fresh generation under the same sealing protocol, and backpressure on long
+scans and arena watermarks bounds memory. This is the main remaining gap: it removes the memory overhead and
+shortens scans.
+\item \textbf{Closing the uncontended gap}: split hot and cold delta fields, and make per-attempt bookkeeping cheaper.
+\item \textbf{Broader comparisons}: real graphs, batch-size sweeps from $2^{10}$ to $2^{22}$, and local builds of LPMA,
+Hornet, faimGraph and SlabGraph.
+\item \textbf{Out of scope}: vertex insertion and deletion, descriptor reuse (needs generation-tagged ids), multiple
+reservation regions (M2), and durability.
+\end{enumerate}
+
+%% ===================================================================================================================
+\section{Conclusion}
+\sys{} shows that GTX's architecture (versioned edge deltas, destination-indexed delta chains, lazily resolved
+descriptors and epoch group commit) transfers to the GPU, provided four parts are redesigned for SIMT execution:
+conflict detection must validate and install on the same observed head, blocks must grow by generations instead of
+copying, commit registration must be a single wait-free RMW, and serializable validation must follow the epoch. The
+result offers multi-edge transactions and non-blocking snapshot readers, which no existing GPU dynamic-graph structure
+provides. It outperforms lock-based and word-STM synchronization by one to four orders of magnitude where
+synchronization is hard, and it pays a bounded, measured cost where it is easy. A history checker that validates every
+operation was essential. It found five protocol defects that a final-state comparison would have missed, and we
+consider it a necessary part of any claim about GPU transaction protocols.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs}
+
+\appendix
+\section{Reproducing the Results}
+All code, raw data and scripts are in the \code{gtx-gpu-research} repository.
+\begin{itemize}
+\item Correctness gate: \code{build.bat test\_gtx \&\& bin\textbackslash test\_gtx.exe full}.
+\item Benchmarks: \code{build.bat bench}; \code{python scripts/run\_matrix.py main|ser|ablation|fair|fairro|gpmamatch|check};
+\code{python scripts/summarize.py} (medians, bootstrap CIs, \code{results/summary.md}, \code{results/speedups.csv}).
+\item GPMA+: \code{baselines/gpma/build\_gpma.bat}; \code{python scripts/run\_gpma.py}.
+\item Source map: \code{src/gtxg.cuh} (engine), \code{src/baselines.cuh} (2PL, TL2, CAS), \code{src/checker.hpp}
+(C1--C5), \code{src/workload.hpp} (generator), \code{src/bench.cu}, \code{src/test\_gtx.cu}.
+\end{itemize}
+
+\end{document}
